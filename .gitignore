@@ -1,0 +1,34 @@
+## Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+## Data (generated locally, not versioned)
+data/*
+!data/.gitkeep
+*.duckdb
+
+## Test/tool caches
+.pytest_cache/
+.ipynb_checkpoints/
+
+## github-log skill run state (ephemeral)
+.github-log-state.json
+
+## Daily session log -- kept locally, deliberately not published
+SESSION_LOG.md
+
+## LaTeX build artifacts for the day-7 IEEE report (.tex and .pdf are committed)
+docs/latex-build/
+
+## Env & secrets
+.env
+*.local
+
+## OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
