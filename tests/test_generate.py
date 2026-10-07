@@ -3,6 +3,8 @@ actually reflecting the hazard it was drawn from.
 """
 from datetime import date
 
+import pytest
+
 from src import generate
 from src.hazard import PLANS
 
@@ -74,6 +76,122 @@ def test_month_rows_cover_every_observed_month_and_one_churn_row():
         tenures = sorted(r["tenure_months"] for r in own)
         # Contiguous from 0, no gaps -- a gap would silently break retention.
         assert tenures == list(range(len(tenures)))
+
+
+def test_no_row_falls_outside_the_observation_window():
+    """`recorded_months` adds a month for the churn row, so the subscriber who
+    churns in their last observable month sits exactly on the window edge. One
+    off-by-one there would date rows past the end of the window and quietly
+    extend the last calendar cohort.
+    """
+    window, start = 24, date(2025, 1, 1)
+    subs = generate.generate_subscribers(count=5000, window_months=window, seed=41)
+    rows = generate.month_rows(subs, start, window) + generate.engagement_rows(
+        subs, start, window, seed=41
+    )
+
+    offsets = [
+        (r["calendar_month"].year - start.year) * 12
+        + r["calendar_month"].month
+        - start.month
+        for r in rows
+    ]
+    assert min(offsets) == 0
+    assert max(offsets) == window - 1
+
+    # The edge case is only guarded if the sample actually contains it.
+    on_edge = [
+        s
+        for s in subs
+        if s.churn_month is not None
+        and s.churn_month == window - s.signup_month - 1
+    ]
+    assert on_edge, "no subscriber churned in their last observable month"
+
+
+def test_engagement_rows_are_deterministic_for_a_seed():
+    """The sampler moved from summed exponentials to numpy for speed; it still
+    has to be reproducible, or no stored dataset can be regenerated."""
+    args = (generate.generate_subscribers(count=150, seed=29), date(2025, 1, 1), 24)
+
+    assert generate.engagement_rows(*args, seed=29) == generate.engagement_rows(
+        *args, seed=29
+    )
+    assert generate.engagement_rows(*args, seed=29) != generate.engagement_rows(
+        *args, seed=30
+    )
+
+
+def test_engagement_and_month_rows_cover_exactly_the_same_months():
+    """The invariant day 4 depends on. Engagement originally stopped one month
+    short of the churn row, which made the two tables disagree on precisely the
+    churned months -- i.e. the target. Keyed on (subscriber, tenure) rather than
+    on row counts, so a count that happens to match but lands on the wrong
+    months still fails.
+    """
+    subs = generate.generate_subscribers(count=400, window_months=24, seed=31)
+    months = generate.month_rows(subs, date(2025, 1, 1), 24)
+    events = generate.engagement_rows(subs, date(2025, 1, 1), 24, seed=31)
+
+    keyed = {(r["subscriber_id"], r["tenure_months"]) for r in months}
+    assert keyed == {(r["subscriber_id"], r["tenure_months"]) for r in events}
+
+    # And the churn months specifically are in there, not just balanced totals.
+    churn_keys = {
+        (r["subscriber_id"], r["tenure_months"]) for r in months if r["churned"]
+    }
+    assert churn_keys and churn_keys <= keyed
+
+
+def test_engagement_rows_have_one_row_per_recorded_month():
+    subs = generate.generate_subscribers(count=400, window_months=24, seed=31)
+    rows = generate.engagement_rows(subs, date(2025, 1, 1), 24, seed=31)
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["subscriber_id"]] = counts.get(row["subscriber_id"], 0) + 1
+
+    for sub in subs:
+        expected = generate.recorded_months(sub, 24)
+        assert counts.get(sub.subscriber_id, 0) == expected
+
+
+def test_churn_month_activity_is_not_a_giveaway():
+    """The leakage check stated as the analyst would hit it: activity in a
+    churn month must look like activity in any other month. If the churn month
+    were systematically empty (or absent), engagement would predict churn
+    perfectly and the day-4 coefficient would be meaningless.
+    """
+    subs = generate.generate_subscribers(count=3000, window_months=24, seed=37)
+    months = generate.month_rows(subs, date(2025, 1, 1), 24)
+    events = {
+        (r["subscriber_id"], r["tenure_months"]): r["events"]
+        for r in generate.engagement_rows(subs, date(2025, 1, 1), 24, seed=37)
+    }
+    level = {s.subscriber_id: s.engagement for s in subs}
+
+    # Compare like with like: churn-month activity against non-churn-month
+    # activity for the same engagement band, so the plan/engagement effect on
+    # churn doesn't masquerade as a churn-month effect.
+    churn, other = [], []
+    for row in months:
+        key = (row["subscriber_id"], row["tenure_months"])
+        if level[row["subscriber_id"]] <= 0.4 or level[row["subscriber_id"]] >= 0.6:
+            continue
+        (churn if row["churned"] else other).append(events[key])
+
+    assert churn, "no churn months in the mid-engagement band to compare"
+    churn_mean = sum(churn) / len(churn)
+    other_mean = sum(other) / len(other)
+    assert churn_mean == pytest.approx(other_mean, rel=0.25), (churn_mean, other_mean)
+    assert min(churn) >= 0 and max(churn) > 0
+
+
+def test_engagement_counts_are_non_negative_integers():
+    subs = generate.generate_subscribers(count=300, seed=33)
+    rows = generate.engagement_rows(subs, date(2025, 1, 1), 24, seed=33)
+
+    assert all(isinstance(r["events"], int) and r["events"] >= 0 for r in rows)
 
 
 def test_engagement_rows_track_the_engagement_level():

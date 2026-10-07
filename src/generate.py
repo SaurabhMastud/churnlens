@@ -12,6 +12,8 @@ import random
 from dataclasses import dataclass
 from datetime import date
 
+import numpy as np
+
 from src.hazard import DEFAULT_MODEL, PLANS, HazardModel
 
 # Signups are spread across the window so cohorts differ in how long they have
@@ -85,14 +87,30 @@ def observed_months(subscriber: Subscriber, window_months: int = 24) -> int:
     return window_months - subscriber.signup_month
 
 
+def recorded_months(subscriber: Subscriber, window_months: int = 24) -> int:
+    """How many months this subscriber has a row for: the active months plus,
+    for a churned subscriber, the month they churned in.
+
+    The churn month is an observed month -- the subscriber was there for it, and
+    their activity during it is what the hazard acted on. Both `month_rows` and
+    `engagement_rows` span this, and they have to agree: when engagement covered
+    only the active months, every churn row had no engagement row and every
+    other row had one, which is a perfect separator. An inner join would have
+    dropped every churn event; a left join filled with zero would have made
+    "no activity" predict churn exactly, reporting leakage as a great model.
+    """
+    return observed_months(subscriber, window_months) + (
+        0 if subscriber.censored else 1
+    )
+
+
 def month_rows(
     subscribers: list[Subscriber], window_start: date, window_months: int = 24
 ) -> list[dict]:
     """Expand to one row per observed subscriber-month."""
     rows = []
     for sub in subscribers:
-        active_months = observed_months(sub, window_months)
-        for tenure in range(active_months + (0 if sub.censored else 1)):
+        for tenure in range(recorded_months(sub, window_months)):
             churned_here = (not sub.censored) and tenure == sub.churn_month
             rows.append(
                 {
@@ -121,20 +139,18 @@ def engagement_rows(
     the point. Recovering the engagement effect from observable activity is the
     day-4 problem.
     """
-    rng = random.Random(seed + 1)
+    # numpy's Poisson rather than summing exponentials by hand: the hand-rolled
+    # version is O(mean) per row over tens of thousands of rows and was most of
+    # the test suite's runtime. numpy is already a dependency for the analysis.
+    rng = np.random.default_rng(seed + 1)
     rows = []
     for sub in subscribers:
-        active_months = observed_months(sub, window_months)
-        mean = base_events * sub.engagement
-        for tenure in range(active_months):
-            # Poisson via sum of exponentials is enough here and keeps the
-            # dependency surface at the stdlib.
-            events, total = 0, 0.0
-            while True:
-                total += rng.expovariate(1.0)
-                if total > mean:
-                    break
-                events += 1
+        # Same span as month_rows, including the churn month -- see
+        # recorded_months for why a mismatch here poisons the day-4 model.
+        counts = rng.poisson(
+            base_events * sub.engagement, size=recorded_months(sub, window_months)
+        )
+        for tenure, events in enumerate(counts):
             rows.append(
                 {
                     "subscriber_id": sub.subscriber_id,
@@ -142,7 +158,7 @@ def engagement_rows(
                     "calendar_month": _month_to_date(
                         window_start, sub.signup_month + tenure
                     ),
-                    "events": events,
+                    "events": int(events),
                 }
             )
     return rows

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Mapping
 
 PLANS = ("basic", "standard", "premium")
 
@@ -29,11 +31,26 @@ class HazardModel:
     """
 
     intercept: float = -1.9
-    plan_effect: dict[str, float] = field(
+    plan_effect: Mapping[str, float] = field(
         default_factory=lambda: {"basic": 0.0, "standard": -0.45, "premium": -0.95}
     )
     tenure_coef: float = -0.55
     engagement_coef: float = -2.4
+
+    def __post_init__(self) -> None:
+        """Make the coefficients actually fixed.
+
+        `frozen=True` blocks attribute reassignment but not mutation of the
+        dict behind `plan_effect`, so `DEFAULT_MODEL.plan_effect["premium"] = 99`
+        silently rewrote the ground truth -- and since DEFAULT_MODEL is one
+        module-level instance shared by the generator, the store and the tests,
+        a single stray write would move the truth for all of them at once.
+        Copy first so a caller mutating the dict they passed in can't reach in
+        either, then wrap it read-only.
+        """
+        object.__setattr__(
+            self, "plan_effect", MappingProxyType(dict(self.plan_effect))
+        )
 
     def monthly_churn_probability(
         self, plan: str, tenure_months: int, engagement: float

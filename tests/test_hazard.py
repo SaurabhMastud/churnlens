@@ -57,6 +57,42 @@ def test_rejects_inputs_it_cannot_model():
         DEFAULT_MODEL.monthly_churn_probability("basic", -1, 0.5)
 
 
+def test_planted_coefficients_cannot_be_mutated():
+    """"Fixed coefficients" is the claim the whole project rests on, and a
+    frozen dataclass does not deliver it on its own: the dict behind
+    plan_effect stayed writable, and DEFAULT_MODEL is one shared instance, so
+    a single stray write moved the ground truth for the generator, the store
+    and every test at once.
+    """
+    with pytest.raises(TypeError):
+        DEFAULT_MODEL.plan_effect["premium"] = 99.0
+    with pytest.raises(TypeError):
+        del DEFAULT_MODEL.plan_effect["premium"]
+    with pytest.raises(AttributeError):
+        DEFAULT_MODEL.intercept = 99.0
+
+    assert DEFAULT_MODEL.plan_effect["premium"] == -0.95
+
+
+def test_a_caller_cannot_mutate_the_model_through_their_own_dict():
+    """Passing a dict in and keeping a reference to it would otherwise be a
+    second way around the same guarantee."""
+    mine = {"basic": 0.0, "standard": -0.4, "premium": -0.8}
+    model = HazardModel(plan_effect=mine)
+
+    mine["premium"] = 99.0
+
+    assert model.plan_effect["premium"] == -0.8
+
+
+def test_equality_survives_the_read_only_wrapper():
+    """as_rows and the store's truth check both compare models; wrapping the
+    mapping must not make two identically-configured models unequal."""
+    assert HazardModel() == HazardModel()
+    assert HazardModel() == DEFAULT_MODEL
+    assert HazardModel(intercept=-1.0) != HazardModel()
+
+
 def test_coefficients_round_trip_to_storable_rows():
     rows = HazardModel().as_rows()
     terms = {term for term, _, _ in rows}

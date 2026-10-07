@@ -6,10 +6,12 @@ process it came from. See the ground-truth contract in docs/ARCHITECTURE.md.
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
 from src import generate
 from src.hazard import DEFAULT_MODEL, HazardModel
@@ -48,6 +50,23 @@ CREATE OR REPLACE TABLE hazard_truth (
 """
 
 
+def _bulk_insert(con, table: str, rows: list[dict]) -> None:
+    """Load rows through a DataFrame scan rather than row-at-a-time INSERT.
+
+    `executemany` autocommits per statement, so a 12k-row load paid 12k disk
+    syncs -- measured at ~34s, which was most of the test suite's runtime. One
+    explicit transaction brings that to ~1.9s and a DataFrame scan to ~0.06s;
+    pandas is already a dependency for the analysis, so the scan is free.
+
+    BY NAME binds on column name, so a reordered dataclass field or dict key
+    can't silently shift values into the wrong column.
+    """
+    if not rows:
+        return
+    frame = pd.DataFrame(rows)  # noqa: F841 -- read by DuckDB's replacement scan
+    con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM frame")
+
+
 def build_store(
     store: str | Path = DEFAULT_STORE,
     count: int = 4000,
@@ -66,45 +85,11 @@ def build_store(
 
     with duckdb.connect(str(store)) as con:
         con.execute(SCHEMA)
-        con.executemany(
-            "INSERT INTO subscribers VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    s.subscriber_id,
-                    s.plan,
-                    s.engagement,
-                    s.signup_month,
-                    s.churn_month,
-                    s.censored,
-                )
-                for s in subscribers
-            ],
-        )
-        con.executemany(
-            "INSERT INTO subscription_months VALUES (?, ?, ?, ?, ?)",
-            [
-                (
-                    r["subscriber_id"],
-                    r["plan"],
-                    r["tenure_months"],
-                    r["calendar_month"],
-                    r["churned"],
-                )
-                for r in months
-            ],
-        )
-        con.executemany(
-            "INSERT INTO engagement_events VALUES (?, ?, ?, ?)",
-            [
-                (
-                    r["subscriber_id"],
-                    r["tenure_months"],
-                    r["calendar_month"],
-                    r["events"],
-                )
-                for r in events
-            ],
-        )
+        _bulk_insert(con, "subscribers", [asdict(s) for s in subscribers])
+        _bulk_insert(con, "subscription_months", months)
+        _bulk_insert(con, "engagement_events", events)
+        # Left on executemany: as_rows() is one row per coefficient, so there is
+        # nothing for a bulk path to win here.
         con.executemany("INSERT INTO hazard_truth VALUES (?, ?, ?)", model.as_rows())
 
     churned = sum(1 for s in subscribers if not s.censored)

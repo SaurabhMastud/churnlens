@@ -67,6 +67,13 @@ spread across the window, so cohorts differ in how long they have been
 observable — without that, every cohort has identical exposure and the
 censoring the survival analysis exists to handle never appears.
 
+`subscription_months` and `engagement_events` share the **same key set** —
+every `(subscriber_id, tenure_months)` in one is in the other, churn months
+included. That is deliberate and tested in both Python and SQL: when engagement
+stopped a month short of the churn row, the two tables disagreed on exactly the
+churned months, which makes an inner join drop every churn event and a
+zero-filled left join predict churn perfectly from leakage alone.
+
 Note that `engagement` on `subscribers` is the *latent* level the hazard uses,
 while `engagement_events` is what an analyst can actually see. Recovering the
 engagement effect from observed activity is the day-4 problem, not a lookup.
@@ -74,4 +81,5 @@ engagement effect from observed activity is the day-4 problem, not a lookup.
 ## Status
 
 Day 1 of 7. The hazard model, the lifecycle generator with correct censoring,
-and the DuckDB load are in place and tested. Cohort retention is day 2.
+and the DuckDB load are in place and tested (57 tests). Cohort retention is
+day 2.
