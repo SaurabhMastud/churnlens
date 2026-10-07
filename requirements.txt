@@ -1,9 +1,26 @@
-duckdb==1.0.0
-pandas==2.2.2
-numpy==1.26.4
-statsmodels==0.14.2
-scikit-learn==1.5.1
+# Pinned to the versions the suite is actually verified against, not the ones
+# guessed on day 1 -- every pin below except streamlit/fpdf2/pypdf had drifted
+# from the installed environment, so `pip install -r` would have built an
+# environment the tests had never run in. Verified on Python 3.11.9.
+
+# In use now
+duckdb==1.5.5
+numpy==2.4.6
+pandas==2.3.3
+pytest==9.1.1
+
+# Later days, installed and importable but not yet exercised by any code:
+#   scikit-learn  -- day 4 churn-driver model
+#   streamlit     -- day 6 dashboard
+#   fpdf2, pypdf  -- day 7 report render and its structural tests
+# Pinned here so the environment is reproducible; each moves up to "in use"
+# on the day its code lands.
+scikit-learn==1.9.0
 streamlit==1.60.0
-pytest==8.3.2
 fpdf2==2.8.8
 pypdf==6.14.2
+
+# statsmodels was pinned on day 1 and is not installed, so that pin was a
+# claim about an environment nobody had built. Dropped rather than carried:
+# scikit-learn covers the day-4 driver model, and if statsmodels turns out to
+# be the better fit it gets added then, at a version that has been run.

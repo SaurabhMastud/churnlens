@@ -30,6 +30,13 @@ beside the data. **Analyses never read that table; tests do.** The channel is
 deliberately one-way: an analysis cannot be tuned against the answer, but a
 test can assert an estimate lands within tolerance of the truth.
 
+The coefficients are not the only ground truth in the store, though.
+`subscribers.engagement` is the *latent* level the hazard was given, and it
+sits in an analysis-facing table — so an analysis could cheat without ever
+reading `hazard_truth`. Both halves of the contract are enforced by tests that
+inspect an analysis module's AST, not by convention. Day 2 considers moving the
+latent column to a truth-side table to close that structurally.
+
 This is the project's central design decision — see `docs/ARCHITECTURE.md`.
 
 ## Project layout
@@ -38,6 +45,7 @@ This is the project's central design decision — see `docs/ARCHITECTURE.md`.
 src/hazard.py       the churn process: coefficients, monthly hazard (ground truth)
 src/generate.py     subscriber lifecycles, subscriber-months, engagement events
 src/store.py        DuckDB load, including hazard_truth
+src/report.py       read-only sanity report (churn by plan, hazard by tenure)
 tests/              pytest suite
 docs/               architecture notes + the day-7 reports
 data/               local DuckDB store (git-ignored)
@@ -48,9 +56,25 @@ data/               local DuckDB store (git-ignored)
 ```bash
 pip install -r requirements.txt
 python -m src.store            # generate lifecycles and load data/churnlens.duckdb
+python -m src.report           # read-only sanity report over the store
 python -m src.hazard           # hazard model self-check
 python -m pytest tests/ -q
 ```
+
+The store build takes parameters — `--count`, `--window-months`, `--seed` and
+`--store` — so a differently-sized or differently-seeded dataset is one flag
+away, and generation is deterministic per seed:
+
+```bash
+python -m src.store --count 20000 --window-months 36 --seed 11
+```
+
+`python -m src.report` prints three cuts, and all three show the planted
+story: cumulative churn falls across basic → standard → premium (20.8% →
+10.2%), the monthly hazard falls from 4.2% in the first month to 0.7% past a
+year's tenure, and churn falls from 29.0% to 9.3% across quartiles of
+*observed* monthly activity. That last one is recovered from event counts
+alone, never from the latent engagement level.
 
 ## Data model
 
@@ -81,5 +105,8 @@ engagement effect from observed activity is the day-4 problem, not a lookup.
 ## Status
 
 Day 1 of 7. The hazard model, the lifecycle generator with correct censoring,
-and the DuckDB load are in place and tested (57 tests). Cohort retention is
-day 2.
+the DuckDB load and a read-only sanity report are in place and tested (79
+tests). The first estimate-vs-truth comparison already holds: averaging the
+planted model over each subscriber's own plan and engagement predicts a 3.920%
+first-month churn hazard, and the generated data gives 3.833% — a gap of 0.34
+binomial standard errors. Cohort retention is day 2.

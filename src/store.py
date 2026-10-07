@@ -6,6 +6,7 @@ process it came from. See the ground-truth contract in docs/ARCHITECTURE.md.
 """
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -111,5 +112,32 @@ def summarise(stats: dict) -> str:
     )
 
 
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Build the ChurnLens DuckDB store.")
+    parser.add_argument("--count", type=int, default=4000, help="subscribers to draw")
+    parser.add_argument(
+        "--window-months", type=int, default=24, help="length of the observation window"
+    )
+    parser.add_argument("--seed", type=int, default=7, help="RNG seed")
+    parser.add_argument("--store", type=Path, default=DEFAULT_STORE)
+    args = parser.parse_args(argv)
+
+    if args.count < 1:
+        parser.error("--count must be at least 1")
+    if args.window_months < 1:
+        parser.error("--window-months must be at least 1")
+
+    print(
+        summarise(
+            build_store(
+                store=args.store,
+                count=args.count,
+                window_months=args.window_months,
+                seed=args.seed,
+            )
+        )
+    )
+
+
 if __name__ == "__main__":
-    print(summarise(build_store()))
+    main()
