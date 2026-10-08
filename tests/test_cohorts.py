@@ -189,6 +189,75 @@ def test_the_curve_pools_exactly_the_cells_the_matrix_shows(con):
         )
 
 
+def test_the_matrix_reconciles_with_the_month_rows(con):
+    """The same fact, counted two independent ways, must agree in every cell.
+
+    The matrix is built from `subscribers.churn_month` and the recorded window.
+    `subscription_months` carries one row per observed subscriber-month, written
+    by a different part of the generator. Retention at tenure t and "has a month
+    row at tenure t" are the same statement, so a disagreement means the
+    retention convention and the month rows have drifted apart -- exactly the
+    off-by-one the module docstring warns about (a churner counted as retained
+    at tenure c + 1 instead of c), which no single-source test can see because
+    both the matrix and the curve would move together.
+
+    Asserted cell by cell rather than on the totals: a cell shifted one tenure
+    earlier and another one later cancels in a total.
+    """
+    matrix = {(r["cohort"], r["tenure"]): r["retained"] for r in cohorts.retention_matrix(con)}
+    month_rows = {
+        (cohort, tenure): n
+        for cohort, tenure, n in con.execute(
+            """
+            select s.signup_month, m.tenure_months, count(*)
+            from subscribers s join subscription_months m using (subscriber_id)
+            group by 1, 2
+            """
+        ).fetchall()
+    }
+
+    assert set(matrix) == set(month_rows), "the two sources disagree on which cells exist"
+    assert matrix == month_rows
+
+
+@pytest.mark.parametrize("tenure", [1, 3, 6, 10])
+def test_cohorts_agree_at_a_given_tenure_because_no_cohort_effect_was_planted(
+    con, tenure
+):
+    """The hazard depends on plan, tenure and engagement -- not on signup month.
+
+    So retention at a fixed tenure should differ between cohorts only by
+    sampling noise, and a cohort sitting well outside that is a real finding:
+    either the generator leaked a calendar effect, or the matrix is indexing
+    cohorts against the wrong tenure column (a classic retention bug, where
+    tenure is computed from the calendar month and every cohort is shifted by
+    its own signup month). The curve alone cannot show this -- pooling averages
+    the shift away.
+
+    Bound is 4.5 binomial se on the pooled rate, with the cohort size as n.
+    Both halves of that choice were measured, not assumed. Noise: the worst |z|
+    over every cell came out at 1.9 / 2.5 / 2.7 on seeds 67 / 11 / 404, so 4.5
+    leaves headroom for the ~70 comparisons this makes. Sensitivity: simulating
+    the calendar-vs-tenure bug -- cohort k reading its tenure k+1 cell -- puts
+    the older cohorts at 10-12 se, far outside the bound.
+
+    What this test does *not* catch is a shift applied uniformly to every
+    cohort, which only moves a cell ~2.5 se here because it has no cohort to
+    disagree with. That one is the planted-survival test's job, which compares
+    against the hazard rather than within the table.
+    """
+    pooled = next(
+        r["retention"] for r in cohorts.retention_curve(con) if r["tenure"] == tenure
+    )
+    cells = [r for r in cohorts.retention_matrix(con) if r["tenure"] == tenure]
+    assert len(cells) >= 5, "too few exposed cohorts at this tenure to say anything"
+
+    for cell in cells:
+        se = math.sqrt(pooled * (1.0 - pooled) / cell["cohort_size"])
+        z = abs(cell["retention"] - pooled) / se
+        assert z < 4.5, (cell, pooled, round(z, 2))
+
+
 @pytest.mark.parametrize("tenure", [1, 2, 3, 5, 8, 12])
 def test_pooled_retention_matches_the_planted_survival_curve(con, planted, tenure):
     """The day-2 result: the retention table recovers the survival function
