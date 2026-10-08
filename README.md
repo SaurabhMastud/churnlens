@@ -51,6 +51,7 @@ src/hazard.py       the churn process: coefficients, monthly hazard (ground trut
 src/generate.py     subscriber lifecycles, subscriber-months, engagement events
 src/store.py        DuckDB load, including hazard_truth
 src/report.py       read-only sanity report (churn by plan, hazard by tenure)
+src/cohorts.py      signup-cohort retention matrix, pooled and per-plan curves
 tests/              pytest suite
 docs/               architecture notes + the day-7 reports
 data/               local DuckDB store (git-ignored)
@@ -62,6 +63,7 @@ data/               local DuckDB store (git-ignored)
 pip install -r requirements.txt
 python -m src.store            # generate lifecycles and load data/churnlens.duckdb
 python -m src.report           # read-only sanity report over the store
+python -m src.cohorts          # signup-cohort retention matrix + retention curves
 python -m src.hazard           # hazard model self-check
 python -m pytest tests/ -q
 ```
@@ -80,6 +82,43 @@ story: cumulative churn falls across basic → standard → premium (20.8% →
 year's tenure, and churn falls from 29.0% to 9.3% across quartiles of
 *observed* monthly activity. That last one is recovered from event counts
 alone, never from the latent engagement level.
+
+## Cohort retention (day 2)
+
+`python -m src.cohorts` prints a signup-cohort retention matrix, the pooled
+curve, and the same curve split by plan. The thing it takes seriously is
+**unequal exposure**: signups are spread across the window, so the cohort that
+joined last month has one month of exposure and cannot be observed at tenure 6.
+
+A cell a cohort has not had time to reach is **left blank, never zeroed**. That
+single choice is the difference between a retention table and a misleading one
+— zero-filling makes young cohorts look like total losses and the curve appear
+to collapse at long tenures, which reads as a real finding and is pure artifact.
+With this dataset, zero-filling drags pooled retention at tenure 12 from 82.5%
+down to 40.5% (and at tenure 6 from 87.3% to 65.7%), and a test asserts the
+distortion rather than trusting the comment.
+
+```
+tenure  cohorts  at risk  retention
+     1       23     3855      95.8%
+     3       21     3498      91.4%
+     6       18     3013      87.3%
+    12       12     1966      82.5%
+    23        1      164      72.6%
+```
+
+The pool thins with tenure, so the `cohorts` and `at risk` columns are printed
+beside the rate rather than left implicit — 72.6% at tenure 23 rests on one
+cohort of 164 subscribers and should not be read as the same kind of number as
+95.8%. Retention is pooled over subscribers, not averaged over cohort rates,
+because an average weights a 150-subscriber cohort the same as a 180-subscriber
+one and cohort size correlates with exposure.
+
+Checked against the hazard the data came from, not just eyeballed: predicted
+survival from the planted coefficients and observed pooled retention agree
+within 4 binomial standard errors at tenures 1, 2, 3, 5, 8 and 12, and the
+per-plan curves recover the planted tier ordering (at tenure 12: basic 78.0%,
+standard 86.0%, premium 91.8%) with the gap widening as tenure grows.
 
 ## Data model
 
@@ -105,15 +144,18 @@ stopped a month short of the churn row, the two tables disagreed on exactly the
 churned months, which makes an inner join drop every churn event and a
 zero-filled left join predict churn perfectly from leakage alone.
 
-Note that `engagement` on `subscribers` is the *latent* level the hazard uses,
-while `engagement_events` is what an analyst can actually see. Recovering the
-engagement effect from observed activity is the day-4 problem, not a lookup.
+`subscriber_truth.engagement` is the *latent* level the hazard uses, and no
+analysis module may read it; `engagement_events` is what an analyst can actually
+see. Recovering the engagement effect from observed activity is the day-4
+problem, not a lookup.
 
 ## Status
 
-Day 1 of 7. The hazard model, the lifecycle generator with correct censoring,
-the DuckDB load and a read-only sanity report are in place and tested (79
-tests). The first estimate-vs-truth comparison already holds: averaging the
-planted model over each subscriber's own plan and engagement predicts a 3.920%
-first-month churn hazard, and the generated data gives 3.833% — a gap of 0.34
-binomial standard errors. Cohort retention is day 2.
+Day 2 of 7. The hazard model, the lifecycle generator with correct censoring,
+the DuckDB load, a read-only sanity report and the cohort retention analysis are
+in place and tested. The estimate-vs-truth comparisons hold at both grains:
+averaging the planted model over each subscriber's own plan and engagement
+predicts a 3.920% first-month churn hazard against 3.833% observed (0.34
+binomial standard errors), and pooled cohort retention matches the planted
+survival function within 4 se at every tenure checked. Survival analysis
+(Kaplan–Meier) is day 3.
