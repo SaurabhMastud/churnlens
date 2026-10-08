@@ -220,6 +220,66 @@ def test_the_matrix_reconciles_with_the_month_rows(con):
     assert matrix == month_rows
 
 
+def test_the_naive_churn_rate_is_exposure_biased_and_the_matrix_is_not(con):
+    """Why this table exists at all, stated as a measurement.
+
+    "Churn rate" as usually computed -- churned subscribers over all
+    subscribers -- is not a rate of anything, because the denominator mixes
+    populations observed for wildly different lengths of time. The cohort that
+    signed up in the first month of the window has had the whole window to
+    churn in; the last one has had a month.
+
+    So the naive number is strongly correlated with signup month, and if those
+    cohorts also differed in some business-relevant way (an acquisition channel
+    ramping up, a price change) the artifact would be read as its effect.
+    Retention at a *fixed tenure* compares like with like and shows no such
+    gradient, which is the whole argument for the matrix over the headline.
+
+    This test is here rather than in a comment because the claim is empirical
+    and the numbers are the point.
+    """
+    naive_spread, naive_corr = con.execute(
+        """
+        with by_cohort as (
+            select signup_month,
+                   avg(case when censored then 0.0 else 1.0 end) as churn_rate
+            from subscribers
+            group by signup_month
+        )
+        select max(churn_rate) - min(churn_rate), corr(churn_rate, signup_month)
+        from by_cohort
+        """
+    ).fetchone()
+
+    # Exposure alone moves the naive rate across a wide band, almost perfectly
+    # ordered by signup month. On the committed 24-month store it runs 27.4%
+    # down to 5.5% with r = -0.86.
+    assert naive_spread > 0.10, naive_spread
+    assert naive_corr < -0.7, naive_corr
+
+    matrix = cohorts.retention_matrix(con)
+    for tenure in (1, 3):
+        cells = sorted(
+            (r["cohort"], r["retention"]) for r in matrix if r["tenure"] == tenure
+        )
+        retention = [value for _, value in cells]
+        spread = max(retention) - min(retention)
+        # Same quantity, measured at equal tenure: a few points of binomial
+        # noise, and no gradient in signup month left to mistake for a trend.
+        assert spread < 0.10, (tenure, spread)
+
+        cohort_index = [cohort for cohort, _ in cells]
+        assert abs(_pearson(cohort_index, retention)) < 0.5, (tenure, cells)
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    spread = math.sqrt(sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys))
+    return cov / spread
+
+
 @pytest.mark.parametrize("tenure", [1, 3, 6, 10])
 def test_cohorts_agree_at_a_given_tenure_because_no_cohort_effect_was_planted(
     con, tenure
