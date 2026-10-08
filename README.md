@@ -30,12 +30,17 @@ beside the data. **Analyses never read that table; tests do.** The channel is
 deliberately one-way: an analysis cannot be tuned against the answer, but a
 test can assert an estimate lands within tolerance of the truth.
 
-The coefficients are not the only ground truth in the store, though.
-`subscribers.engagement` is the *latent* level the hazard was given, and it
-sits in an analysis-facing table — so an analysis could cheat without ever
-reading `hazard_truth`. Both halves of the contract are enforced by tests that
-inspect an analysis module's AST, not by convention. Day 2 considers moving the
-latent column to a truth-side table to close that structurally.
+The coefficients are not the only ground truth in the store. The *latent*
+engagement level the hazard was given is per-subscriber truth, and on day 1 it
+sat on `subscribers` — an analysis-facing table — so an analysis could cheat
+without ever reading `hazard_truth`. A mutation test caught exactly that:
+swapping the latent level in for observed activity passed every other test and
+produced a *cleaner* result.
+
+Day 2 moved it to `subscriber_truth`, so the quarantine is structural — an
+analysis cannot read a column that is not in the table it queries. The AST
+guards remain as a second line, and now discover every analysis module
+automatically rather than being opted into one at a time.
 
 This is the project's central design decision — see `docs/ARCHITECTURE.md`.
 
@@ -80,10 +85,12 @@ alone, never from the latent engagement level.
 
 | Table | Grain | What it holds |
 |---|---|---|
-| `subscribers` | one subscriber | plan, latent engagement, signup month, churn month, censoring flag |
+| `subscribers` | one subscriber | plan, signup month, churn month, censoring flag |
+| `subscriber_truth` | one subscriber | the *latent* engagement level the hazard was given — quarantined, for tests only |
 | `subscription_months` | subscriber × tenure month | the observed active months, with the churn month flagged |
 | `engagement_events` | subscriber × tenure month | monthly activity counts — the *observable* engagement signal |
 | `hazard_truth` | one coefficient | the planted coefficients, for tests only |
+| `run_meta` | one row per build | observation window, subscriber count, seed — dataset provenance |
 
 Subscribers still active when the observation window closes are
 **right-censored**: `churn_month` is null and `censored` is true. Signups are

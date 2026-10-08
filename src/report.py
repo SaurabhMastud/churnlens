@@ -1,10 +1,14 @@
 """Read-only sanity report over the generated store.
 
 This is the first *analysis* in the project, so it is the first code the
-ground-truth contract applies to: nothing here may read `hazard_truth`. The
-tests read it and check these numbers against the planted coefficients -- the
-channel stays one-way, which is what makes that check evidence rather than a
-tautology. A test asserts this module never names the table.
+ground-truth contract applies to: nothing here may read either truth table --
+the planted coefficients, or the per-subscriber latent engagement level. The
+tests read both and check these numbers against them; the channel stays
+one-way, which is what makes that check evidence rather than a tautology.
+
+The latent level is not in the tables queried below, so the quarantine is
+structural rather than a promise. tests/test_contract.py enforces the rest
+across every analysis module, discovered rather than listed.
 
 Deliberately plain SQL aggregates, not the day-2 cohort matrix: the point is a
 first look that can be compared to the process the data came from.

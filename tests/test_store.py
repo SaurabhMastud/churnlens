@@ -2,6 +2,8 @@
 arrive in the store intact, because every later analytical test reads it from
 there rather than from src.hazard.
 """
+import dataclasses
+
 import duckdb
 import pytest
 
@@ -89,6 +91,150 @@ def test_exactly_one_churn_row_per_churned_subscriber(built):
     assert bad == 0
 
 
+def test_two_builds_with_the_same_parameters_are_identical(tmp_path):
+    """Reproducibility end to end, not just in the generator.
+
+    `test_generation_is_deterministic_for_a_seed` covers the Python objects.
+    This covers everything after them -- the DataFrame round trip, the column
+    binding, the truth split -- by building two independent stores and
+    comparing every table's full contents. A seeded dataset nobody else can
+    reproduce would undercut the entire premise of the project.
+    """
+    params = dict(count=400, window_months=12, seed=91)
+    first, second = tmp_path / "a.duckdb", tmp_path / "b.duckdb"
+    store.build_store(store=first, **params)
+    store.build_store(store=second, **params)
+
+    tables = (
+        "subscribers",
+        "subscriber_truth",
+        "subscription_months",
+        "engagement_events",
+        "hazard_truth",
+    )
+    with duckdb.connect(str(first)) as a, duckdb.connect(str(second)) as b:
+        for table in tables:
+            order = "all"
+            rows_a = a.execute(f"select * from {table} order by {order}").fetchall()
+            rows_b = b.execute(f"select * from {table} order by {order}").fetchall()
+            assert rows_a == rows_b, table
+            assert rows_a, f"{table} is empty, so comparing it proves nothing"
+
+        # run_meta excludes nothing but is compared separately: it records the
+        # parameters, so identical parameters must give an identical row.
+        assert (
+            a.execute("select * from run_meta").fetchall()
+            == b.execute("select * from run_meta").fetchall()
+        )
+
+
+def test_different_seeds_produce_different_data(tmp_path):
+    """Guards the test above from passing because the seed is ignored."""
+    first, second = tmp_path / "a.duckdb", tmp_path / "b.duckdb"
+    store.build_store(store=first, count=400, window_months=12, seed=91)
+    store.build_store(store=second, count=400, window_months=12, seed=92)
+
+    with duckdb.connect(str(first)) as a, duckdb.connect(str(second)) as b:
+        assert (
+            a.execute("select * from subscribers order by all").fetchall()
+            != b.execute("select * from subscribers order by all").fetchall()
+        )
+
+
+def test_run_meta_records_the_build_parameters(built):
+    """Provenance for the dataset, and the observation window in particular.
+
+    The window has to be recorded rather than inferred from the rows: deriving
+    it as max(signup_month + tenure_months) + 1 is exact only when some
+    subscriber reaches the final month, which small stores can violate.
+    """
+    path, stats = built
+
+    with duckdb.connect(str(path)) as con:
+        rows = con.execute(
+            "select window_months, subscriber_count, seed from run_meta"
+        ).fetchall()
+
+    assert len(rows) == 1, "run_meta is one row per build, and a rebuild replaces it"
+    window, count, seed = rows[0]
+    assert window == BUILD["window_months"]
+    assert count == BUILD["count"] == stats["subscribers"]
+    assert seed == BUILD["seed"]
+
+
+def test_rebuilding_does_not_accumulate_run_meta_rows(built):
+    """CREATE OR REPLACE covers this, but run_meta is the one table where a
+    second row would make every reader's `fetchone()` silently arbitrary."""
+    path, _ = built
+    store.build_store(store=path, **BUILD)
+
+    with duckdb.connect(str(path)) as con:
+        assert con.execute("select count(*) from run_meta").fetchone()[0] == 1
+
+
+def test_the_latent_level_is_not_on_the_analysis_facing_table(built):
+    """The structural half of the ground-truth contract. Until day 2 the latent
+    engagement sat on `subscribers`, where any analysis could read it; a test
+    was the only thing stopping that, and tests are per-module. Now the column
+    simply is not there to read.
+    """
+    path, _ = built
+
+    with duckdb.connect(str(path)) as con:
+        analysis_facing = {
+            row[0]
+            for row in con.execute("describe subscribers").fetchall()
+        }
+        quarantined = {
+            row[0]
+            for row in con.execute("describe subscriber_truth").fetchall()
+        }
+
+    assert "engagement" not in analysis_facing
+    assert "engagement" in quarantined
+    assert store.LATENT_FIELDS <= quarantined
+
+
+def test_the_two_subscriber_tables_partition_every_dataclass_field(built):
+    """A field added to `Subscriber` has to land in exactly one of the two
+    tables. Without this, adding one would silently drop it from the store --
+    the load splits on LATENT_FIELDS rather than listing columns, so there is
+    nothing else to notice the omission.
+    """
+    path, _ = built
+    fields = {f.name for f in dataclasses.fields(generate.Subscriber)}
+
+    with duckdb.connect(str(path)) as con:
+        plain = {row[0] for row in con.execute("describe subscribers").fetchall()}
+        truth = {row[0] for row in con.execute("describe subscriber_truth").fetchall()}
+
+    # subscriber_id is the join key, so it is legitimately in both.
+    assert plain | truth == fields
+    assert plain & truth == {"subscriber_id"}
+
+
+def test_every_subscriber_has_exactly_one_truth_row(built):
+    """The join in the estimate-vs-truth tests is only sound if it neither
+    drops nor duplicates subscribers."""
+    path, stats = built
+
+    with duckdb.connect(str(path)) as con:
+        assert (
+            con.execute("select count(*) from subscriber_truth").fetchone()[0]
+            == stats["subscribers"]
+        )
+        assert (
+            con.execute(
+                """
+                select count(*) from subscribers s
+                full outer join subscriber_truth t using (subscriber_id)
+                where s.subscriber_id is null or t.subscriber_id is null
+                """
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_month_and_engagement_keys_match_in_sql(built):
     """The generator-level version of this invariant is in test_generate; this
     is the same check where day 4 will actually hit it -- as a join in the
@@ -150,11 +296,14 @@ def test_subscribers_round_trip_exactly(built):
     }
 
     with duckdb.connect(str(path)) as con:
+        # engagement comes from subscriber_truth now, so the round trip has to
+        # be checked across the join that splits the dataclass in two.
         stored = con.execute(
             """
-            select subscriber_id, plan, engagement, signup_month, churn_month,
-                   censored
-            from subscribers
+            select s.subscriber_id, s.plan, t.engagement, s.signup_month,
+                   s.churn_month, s.censored
+            from subscribers s
+            join subscriber_truth t using (subscriber_id)
             """
         ).fetchall()
 

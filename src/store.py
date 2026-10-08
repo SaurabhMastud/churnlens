@@ -1,8 +1,14 @@
 """DuckDB load for generated lifecycles.
 
-The hazard coefficients are written to `hazard_truth` alongside the data.
-Analyses must not read that table -- tests do, to check an estimate against the
-process it came from. See the ground-truth contract in docs/ARCHITECTURE.md.
+The store is split by the ground-truth contract. Two tables are quarantined --
+`hazard_truth` (the planted coefficients) and `subscriber_truth` (each
+subscriber's latent engagement level) -- and analyses must not read either;
+tests do, to check an estimate against the process it came from. Everything
+else is analysis-facing, including `run_meta`, since the length of the
+observation window is something an analyst legitimately knows.
+
+Splitting the subscriber row across two tables is what makes the quarantine
+structural rather than a promise. See docs/ARCHITECTURE.md.
 """
 from __future__ import annotations
 
@@ -21,14 +27,26 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_STORE = PROJECT_ROOT / "data" / "churnlens.duckdb"
 WINDOW_START = date(2025, 1, 1)
 
+# Subscriber fields that are ground truth rather than things an analyst could
+# observe. These go to subscriber_truth; everything else goes to subscribers.
+LATENT_FIELDS = frozenset({"engagement"})
+
+# Why the split: leaving the latent level on an analysis-facing table let an
+# analysis read the answer without ever touching hazard_truth, which a mutation
+# test caught doing exactly that -- and it produced a *cleaner* result, so
+# nothing would have looked wrong. A structural quarantine beats a per-module
+# guard because days 3-6 add three more analysis modules.
 SCHEMA = """
 CREATE OR REPLACE TABLE subscribers (
     subscriber_id  VARCHAR PRIMARY KEY,
     plan           VARCHAR NOT NULL,
-    engagement     DOUBLE  NOT NULL,
     signup_month   INTEGER NOT NULL,
     churn_month    INTEGER,
     censored       BOOLEAN NOT NULL
+);
+CREATE OR REPLACE TABLE subscriber_truth (
+    subscriber_id  VARCHAR PRIMARY KEY,
+    engagement     DOUBLE  NOT NULL
 );
 CREATE OR REPLACE TABLE subscription_months (
     subscriber_id  VARCHAR NOT NULL,
@@ -47,6 +65,19 @@ CREATE OR REPLACE TABLE hazard_truth (
     term  VARCHAR NOT NULL,
     kind  VARCHAR NOT NULL,
     value DOUBLE  NOT NULL
+);
+-- Run provenance, one row. Analysis-facing: the length of the observation
+-- window is something an analyst legitimately knows, not a fact about the
+-- churn process. Recorded rather than inferred because inferring it from
+-- max(signup_month + tenure_months) is only exact when some subscriber is
+-- observed to the final month -- true for any realistic size, silently wrong
+-- on small data (demonstrated: a one-subscriber, 24-month store whose only
+-- subscriber churned early reported a 20-month window).
+CREATE OR REPLACE TABLE run_meta (
+    window_months    INTEGER NOT NULL,
+    subscriber_count INTEGER NOT NULL,
+    seed             INTEGER NOT NULL,
+    window_start     DATE    NOT NULL
 );
 """
 
@@ -86,12 +117,38 @@ def build_store(
 
     with duckdb.connect(str(store)) as con:
         con.execute(SCHEMA)
-        _bulk_insert(con, "subscribers", [asdict(s) for s in subscribers])
+        # Split by LATENT_FIELDS rather than by hand-listing each table's
+        # columns: a field added to Subscriber then lands in one table or the
+        # other automatically, and a test asserts the two together account for
+        # every field, so a new one cannot be silently dropped from the store.
+        _bulk_insert(
+            con,
+            "subscribers",
+            [
+                {k: v for k, v in asdict(s).items() if k not in LATENT_FIELDS}
+                for s in subscribers
+            ],
+        )
+        _bulk_insert(
+            con,
+            "subscriber_truth",
+            [
+                {"subscriber_id": s.subscriber_id}
+                | {f: getattr(s, f) for f in LATENT_FIELDS}
+                for s in subscribers
+            ],
+        )
         _bulk_insert(con, "subscription_months", months)
         _bulk_insert(con, "engagement_events", events)
         # Left on executemany: as_rows() is one row per coefficient, so there is
         # nothing for a bulk path to win here.
         con.executemany("INSERT INTO hazard_truth VALUES (?, ?, ?)", model.as_rows())
+        con.execute(
+            "INSERT INTO run_meta VALUES (?, ?, ?, ?)",
+            # len(subscribers), not the requested count: provenance should
+            # record what was actually loaded, not what was asked for.
+            [window_months, len(subscribers), seed, WINDOW_START],
+        )
 
     churned = sum(1 for s in subscribers if not s.censored)
     return {

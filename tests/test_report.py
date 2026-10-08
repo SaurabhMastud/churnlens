@@ -1,14 +1,14 @@
 """Sanity-report checks -- the project's first estimate-vs-truth tests.
 
-These read `hazard_truth`, which the report itself must not. The coefficients
+These read the truth tables, which the report itself must not. The coefficients
 are rebuilt into probabilities here from the *stored* rows rather than imported
 from src.hazard, which also checks that what the store carries is actually
 usable as ground truth rather than just present.
+
+The contract guards that used to live here now cover every analysis module
+automatically -- see tests/test_contract.py.
 """
-import ast
-import inspect
 import math
-import re
 
 import duckdb
 import pytest
@@ -46,93 +46,6 @@ def planted_probability(truth: dict, plan: str, tenure: int, engagement: float) 
         + truth["engagement"] * engagement
     )
     return 1.0 / (1.0 + math.exp(-logit))
-
-
-def _code_strings(module) -> list[str]:
-    """Every string literal the module's *code* uses, docstrings excluded.
-
-    A plain substring scan over the source cannot do this job: the module
-    explains the contract in its own docstring, so naming the table in prose
-    would fail the check while an actual query is what matters. SQL lives in
-    string literals, so those are what gets inspected -- including the pieces
-    of f-strings, which is how the bucketed query is built.
-    """
-    tree = ast.parse(inspect.getsource(module))
-    docstrings = {
-        id(node.body[0].value)
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef))
-        and node.body
-        and isinstance(node.body[0], ast.Expr)
-        and isinstance(node.body[0].value, ast.Constant)
-        and isinstance(node.body[0].value.value, str)
-    }
-    return [
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and id(node) not in docstrings
-    ]
-
-
-def _imported_modules(module) -> set[str]:
-    tree = ast.parse(inspect.getsource(module))
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            names.add(node.module or "")
-            names.update(f"{node.module}.{a.name}" for a in node.names)
-    return names
-
-
-def test_the_report_never_reads_the_ground_truth():
-    """The contract, enforced mechanically rather than by convention. An
-    analysis that reads hazard_truth could be tuned against the answer, and
-    every comparison in this file would stop being evidence.
-    """
-    assert not [s for s in _code_strings(report) if "hazard_truth" in s]
-    assert not [m for m in _imported_modules(report) if m.startswith("src.hazard")]
-
-
-def test_the_report_never_reads_the_latent_engagement_level():
-    """`hazard_truth` is not the only ground truth in the store.
-
-    `subscribers.engagement` is the latent level the hazard was actually given,
-    and it sits in an analysis-facing table, so an analysis can reach it
-    without touching the quarantined coefficients at all. Substituting it for
-    observed activity in the quartile cut passed every other test in this file
-    -- the gradient is cleaner with the latent value, which is precisely why
-    using it would be cheating. Recovering the effect from `engagement_events`
-    is the day-4 problem.
-
-    `\\bengagement\\b` does not match inside `engagement_events`, since `_` is a
-    word character -- so the legitimate table reference is allowed and a bare
-    column reference is not.
-    """
-    offenders = [
-        s for s in _code_strings(report) if re.search(r"\bengagement\b", s)
-    ]
-
-    assert not offenders, offenders
-
-
-def test_the_latent_engagement_guard_matches_the_real_column_name():
-    """The guard above is a regex over SQL, so it is only worth anything if the
-    column is still called what it thinks. Asserted against the schema rather
-    than trusted."""
-    assert re.search(r"\bengagement\b", store.SCHEMA)
-    assert "engagement_events" in store.SCHEMA
-
-
-def test_the_contract_check_would_catch_a_violation():
-    """The guard above passes trivially if _code_strings is broken, so prove it
-    sees a query that is really there -- the report does read subscribers."""
-    assert [s for s in _code_strings(report) if "from subscribers" in s]
-    assert [s for s in _code_strings(report) if "subscription_months" in s]
-    assert _imported_modules(report) >= {"src.store", "src.store.DEFAULT_STORE"}
 
 
 def test_churn_by_plan_recovers_the_planted_plan_ordering(con, truth):
@@ -233,7 +146,13 @@ def test_observed_tenure_zero_hazard_matches_the_planted_model(con, truth):
     compare to what the data actually did. Tenure 0 is used because the tenure
     term is zero there, so a disagreement cannot hide in the tenure coefficient.
     """
-    subscribers = con.execute("select plan, engagement from subscribers").fetchall()
+    subscribers = con.execute(
+        """
+        select s.plan, t.engagement
+        from subscribers s
+        join subscriber_truth t using (subscriber_id)
+        """
+    ).fetchall()
     expected = sum(
         planted_probability(truth, plan, 0, engagement)
         for plan, engagement in subscribers
