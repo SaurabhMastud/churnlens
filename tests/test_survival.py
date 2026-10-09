@@ -322,6 +322,92 @@ def test_per_plan_risk_sets_partition_the_pooled_one(con):
             assert value == pooled[tenure][key], (tenure, key)
 
 
+def test_per_plan_curves_recover_the_planted_tier_ordering(con, planted):
+    """Each plan's own curve, checked against its own planted survival.
+
+    The pooled curve can be right while the split is wrong -- a segment column
+    joined on the wrong key would mix the groups and leave the total intact --
+    so the per-plan curves are compared to per-plan predictions rather than
+    only to each other.
+    """
+    truth, subscribers = planted
+    curves = survival.kaplan_meier_by_segment(con, "plan")
+    assert set(curves) == {"basic", "standard", "premium"}
+
+    tenure = 6
+    for plan, curve in curves.items():
+        cohort = [e for subscriber_plan, e in subscribers if subscriber_plan == plan]
+        expected = sum(
+            math.prod(
+                1.0 - _planted_hazard(truth, plan, k, engagement)
+                for k in range(tenure + 1)
+            )
+            for engagement in cohort
+        ) / len(cohort)
+
+        row = curve[tenure]
+        assert row["survival"] == pytest.approx(expected, abs=4 * row["se"]), (
+            plan,
+            row["survival"],
+            expected,
+        )
+
+    at_six = {plan: curve[tenure]["survival"] for plan, curve in curves.items()}
+    assert at_six["premium"] > at_six["standard"] > at_six["basic"], at_six
+
+
+def test_the_log_rank_fires_on_the_planted_plan_effect_in_the_right_direction(con):
+    """A significant statistic is only half of it: the observed-minus-expected
+    per group has to point the way the coefficients were planted. A test on the
+    statistic alone passes just as well if the groups are swapped.
+    """
+    result = survival.logrank(con, "plan")
+
+    assert result["df"] == 2
+    assert result["statistic"] > result["critical_05"], result
+    assert result["significant"] is True
+
+    # Churn is planted highest on basic and lowest on premium, so basic must
+    # churn more than a shared hazard predicts and premium less.
+    assert result["observed"]["basic"] > result["expected"]["basic"]
+    assert result["observed"]["premium"] < result["expected"]["premium"]
+    # Total events are conserved: expectations redistribute them, nothing else.
+    assert sum(result["observed"].values()) == pytest.approx(
+        sum(result["expected"].values()), rel=1e-9
+    )
+
+
+def test_the_log_rank_does_not_fire_on_a_dataset_with_no_plan_effect(tmp_path):
+    """Calibration, which a significance test is not much use without.
+
+    The planted hazard can be rebuilt with every plan effect set to zero, which
+    gives a dataset where the null hypothesis is *true* by construction. Across
+    seeds 0-9 (1500 subscribers, 12 months) the statistic came out between 0.59
+    and 7.26, crossing the 5.991 critical value once -- about the 5% false
+    positive rate the test is supposed to have. So the assertion is on the rate,
+    not on a single draw: a test demanding zero rejections from a correct 5%
+    test would be a test that the test is broken.
+
+    Worth recording: at 2000 subscribers over 20 seeds nothing fired at all
+    (max statistic 4.5). The simplified (O-E)^2/E form used here is known to be
+    conservative relative to the full variance version, so a non-significant
+    result from it means "not shown", not "no difference".
+    """
+    from src.hazard import HazardModel
+
+    flat = HazardModel(plan_effect={plan: 0.0 for plan in ("basic", "standard", "premium")})
+    rejections = []
+    for seed in range(10):
+        path = tmp_path / f"null{seed}.duckdb"
+        store.build_store(store=path, count=1500, window_months=12, seed=seed, model=flat)
+        with duckdb.connect(str(path), read_only=True) as con:
+            result = survival.logrank(con, "plan")
+        if result["significant"]:
+            rejections.append((seed, round(result["statistic"], 2)))
+
+    assert len(rejections) <= 2, rejections
+
+
 def test_render_reports_the_curve_and_the_median_honestly(built):
     text = survival.render(built, max_tenure=6)
 
