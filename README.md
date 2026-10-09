@@ -52,6 +52,7 @@ src/generate.py     subscriber lifecycles, subscriber-months, engagement events
 src/store.py        DuckDB load, including hazard_truth
 src/report.py       read-only sanity report (churn by plan, hazard by tenure)
 src/cohorts.py      signup-cohort retention matrix, pooled and per-plan curves
+src/survival.py     Kaplan-Meier survival, log-rank comparison between plans
 tests/              pytest suite
 docs/               architecture notes + the day-7 reports
 data/               local DuckDB store (git-ignored)
@@ -64,6 +65,7 @@ pip install -r requirements.txt
 python -m src.store            # generate lifecycles and load data/churnlens.duckdb
 python -m src.report           # read-only sanity report over the store
 python -m src.cohorts          # signup-cohort retention matrix + retention curves
+python -m src.survival         # Kaplan-Meier curve, median, log-rank across plans
 python -m src.hazard           # hazard model self-check
 python -m pytest tests/ -q
 ```
@@ -120,6 +122,42 @@ within 4 binomial standard errors at tenures 1, 2, 3, 5, 8 and 12, and the
 per-plan curves recover the planted tier ordering (at tenure 12: basic 78.0%,
 standard 86.0%, premium 91.8%) with the gap widening as tenure grows.
 
+## Survival analysis (day 3)
+
+`python -m src.survival` prints the Kaplan-Meier curve with its risk table,
+median survival, per-plan curves and a log-rank test. Censoring is the reason
+this exists rather than a retention percentage: most subscribers here have not
+churned *and* have not been observed to the end of their life either.
+
+```
+tenure  at risk  churned  censored  hazard  survival      95% CI
+     0     4000      168       137   4.20%     95.8%   95.1%-96.4%
+     1     3695       94       173   2.54%     93.4%   92.5%-94.1%
+     6     2629       34       146   1.29%     86.0%   84.9%-87.1%
+    12     1936       19       141   0.98%     82.8%   81.5%-84.1%
+
+Median survival: not reached within the observation window (lowest S = 75.9%)
+Log-rank across plans: chi2 = 49.3 on 2 df, critical value 5.991 -- not noise
+```
+
+Three things in that output are deliberate:
+
+- **"Not reached"** rather than a median. The curve bottoms out at 75.9%,
+  nowhere near 0.5. Printing the last observed tenure instead would report a
+  number set by the window length, not by churn.
+- **Log-log intervals**, so the upper bound cannot exceed 1. The usual
+  `S +/- 1.96*se` does exactly that near the top of a curve; on a
+  40-subscriber store it reaches 1.023, which is a claim that more than
+  everyone survived.
+- **The risk table printed beside the estimate**, because `at risk` falling
+  from 4000 to 1936 is the context that makes the later numbers readable.
+
+The naive alternative is quantified rather than dismissed: "1 - churned/total"
+gives 82.9% where KM gives 75.9%, seven points of optimism that gets *better*
+the shorter the window, since a shorter window censors more people. Counting
+the end of observation as an exit, or keeping only subscribers with an observed
+churn, both collapse survival to 0.0%. All three are tests.
+
 ## Data model
 
 | Table | Grain | What it holds |
@@ -151,11 +189,11 @@ problem, not a lookup.
 
 ## Status
 
-Day 2 of 7. The hazard model, the lifecycle generator with correct censoring,
-the DuckDB load, a read-only sanity report and the cohort retention analysis are
-in place and tested. The estimate-vs-truth comparisons hold at both grains:
-averaging the planted model over each subscriber's own plan and engagement
-predicts a 3.920% first-month churn hazard against 3.833% observed (0.34
-binomial standard errors), and pooled cohort retention matches the planted
-survival function within 4 se at every tenure checked. Survival analysis
-(Kaplan–Meier) is day 3.
+Day 3 of 7. The hazard model, the lifecycle generator with correct censoring,
+the DuckDB load, the sanity report, cohort retention and Kaplan–Meier survival
+are in place and tested. Every analysis so far lands on the process it was
+drawn from: a 3.920% predicted first-month hazard against 3.833% observed (0.34
+binomial se), cohort retention within 4 se of the planted survival function at
+every tenure checked, and the KM curve within 0.17–2.18 se of it across three
+seeds. The churn-driver model — does a fitted model recover the planted
+coefficients and their ordering — is day 4.

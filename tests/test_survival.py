@@ -295,6 +295,35 @@ def test_dropping_censored_subscribers_entirely_is_worse_than_either(con):
     assert survival_estimate < 0.01, survival_estimate
 
 
+def test_km_and_the_day_two_retention_curve_tell_the_same_story(con):
+    """Two estimators, two definitions of the risk set, one truth.
+
+    Day 2's cohort curve pools only cohorts with exposure at a tenure. KM keeps
+    everyone for the months they were observed and drops them after. They are
+    not the same computation, and they are not forced to agree -- which is what
+    makes the comparison worth making: both are attempts at the same marginal
+    survival function from different directions.
+
+    The offset is a convention, not a fudge. Cohort retention at tenure t is
+    "still subscribed at the *start* of month t", while KM's S(t) is "survived
+    *through* month t", so retention(t) lines up with S(t-1). Gaps come out at
+    0.05-1.14 Greenwood se on the committed store, widening at long tenures
+    where the two risk sets differ most.
+    """
+    from src import cohorts
+
+    km = survival.kaplan_meier(con)
+    retention = {row["tenure"]: row["retention"] for row in cohorts.retention_curve(con)}
+
+    for tenure in (1, 3, 6, 12, 17):
+        if tenure not in retention:
+            continue
+        estimate = km[tenure - 1]
+        assert estimate["survival"] == pytest.approx(
+            retention[tenure], abs=4 * estimate["se"]
+        ), (tenure, estimate["survival"], retention[tenure])
+
+
 def test_an_unknown_segment_is_refused():
     with duckdb.connect(":memory:") as con:
         for call in (
