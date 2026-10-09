@@ -165,6 +165,136 @@ def test_a_month_with_no_churn_leaves_survival_and_the_interval_alone():
     assert curve[2]["se"] > curve[1]["se"]
 
 
+@pytest.fixture(scope="module")
+def planted(con):
+    """Coefficients and each subscriber's latent level. Tests may read truth."""
+    truth = dict(con.execute("select term, value from hazard_truth").fetchall())
+    subscribers = con.execute(
+        """
+        select s.plan, t.engagement
+        from subscribers s join subscriber_truth t using (subscriber_id)
+        """
+    ).fetchall()
+    return truth, subscribers
+
+
+def _planted_hazard(truth: dict, plan: str, tenure: int, engagement: float) -> float:
+    logit = (
+        truth["intercept"]
+        + truth[f"plan_{plan}"]
+        + truth["tenure_log1p"] * math.log1p(tenure)
+        + truth["engagement"] * engagement
+    )
+    return 1.0 / (1.0 + math.exp(-logit))
+
+
+def _planted_survival(planted, tenure: int) -> float:
+    """Mean survival through `tenure`, over the whole generated population.
+
+    Over everyone rather than over the risk set at `tenure`, deliberately. KM
+    estimates the *marginal* survival function, and it is consistent for it
+    when censoring is independent of the event -- which holds here because
+    censoring is administrative: it is set by signup month, which the hazard
+    does not depend on. Averaging the prediction over the survivors instead
+    would compare KM against a different quantity and the gap would widen with
+    tenure as the risk set selects for low-hazard subscribers.
+    """
+    truth, subscribers = planted
+    return sum(
+        math.prod(
+            1.0 - _planted_hazard(truth, plan, k, engagement)
+            for k in range(tenure + 1)
+        )
+        for plan, engagement in subscribers
+    ) / len(subscribers)
+
+
+@pytest.mark.parametrize("tenure", [0, 1, 3, 6, 11, 17])
+def test_the_km_curve_recovers_the_planted_survival_function(con, planted, tenure):
+    """The day-3 result: the estimate lands on the process that generated it.
+
+    Tolerance is 4 Greenwood standard errors. Measured gaps on seed 67 are
+    1.03 / 1.14 / 1.55 / 0.75 / 0.38 / 0.17 se at the tenures checked, and the
+    worst gap over seeds 11 and 404 was 2.18 and 1.00 se, so 4 is loose enough
+    not to flake and tight enough to catch a hazard off by a few points.
+    """
+    observed = survival.kaplan_meier(con)[tenure]
+    expected = _planted_survival(planted, tenure)
+
+    assert observed["survival"] == pytest.approx(
+        expected, abs=4 * observed["se"]
+    ), (tenure, observed["survival"], expected, observed["se"])
+
+
+def test_ignoring_censoring_flatters_retention_by_a_measurable_amount(con, planted):
+    """The error KM exists to avoid, quantified on this dataset.
+
+    "1 - churned/total" treats every censored subscriber as a permanent
+    survivor, which is the single most common retention number in circulation.
+    On this store it reports 84.2% against a KM estimate of 77.2% at the last
+    observed tenure -- seven points of optimism, and it would get *better*
+    looking if the window were shortened, since a shorter window censors more
+    people.
+    """
+    curve = survival.kaplan_meier(con)
+    total, churned = con.execute(
+        "select count(*), count(*) filter (where not censored) from subscribers"
+    ).fetchone()
+
+    naive = 1.0 - churned / total
+    final = curve[-1]["survival"]
+    truth = _planted_survival(planted, curve[-1]["tenure"])
+
+    assert naive > final + 0.04, (naive, final)
+    # And it is the naive number that is wrong, not KM: KM sits on the truth.
+    assert abs(final - truth) < abs(naive - truth)
+
+
+def test_treating_censored_subscribers_as_churn_destroys_the_curve(con):
+    """The opposite error, and the reason the risk table derives censoring
+    instead of assuming the last observed month is an exit.
+
+    Anyone whose observation ends gets counted as having churned: survival
+    collapses from 77.2% to 0.0% here, because in a window where most people
+    are censored, that assumption says almost everybody left.
+    """
+    table = survival.risk_table(con)
+    mutated = [
+        {**row, "events": row["events"] + row["censored"], "censored": 0}
+        for row in table
+    ]
+
+    correct = survival._accumulate(table)[-1]["survival"]
+    broken = survival._accumulate(mutated)[-1]["survival"]
+
+    assert correct > 0.7
+    assert broken < 0.01, broken
+
+
+def test_dropping_censored_subscribers_entirely_is_worse_than_either(con):
+    """Complete-case analysis, the third way this goes wrong.
+
+    Restricting to subscribers with an observed churn means restricting to
+    people who churned, so survival goes to zero by construction -- the
+    selection is on the outcome. Included because it looks the most defensible
+    of the three ("only use complete data") and is the most badly wrong.
+    """
+    rows = con.execute(
+        """
+        select m.tenure_months, count(*), count(*) filter (where m.churned)
+        from subscription_months m join subscribers s using (subscriber_id)
+        where not s.censored
+        group by 1 order by 1
+        """
+    ).fetchall()
+
+    survival_estimate = 1.0
+    for _, at_risk, events in rows:
+        survival_estimate *= 1.0 - events / at_risk
+
+    assert survival_estimate < 0.01, survival_estimate
+
+
 def test_an_unknown_segment_is_refused():
     with duckdb.connect(":memory:") as con:
         for call in (
