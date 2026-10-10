@@ -165,6 +165,141 @@ def test_the_split_is_deterministic_for_a_seed_and_moves_with_it(rows):
     ]
 
 
+@pytest.fixture(scope="module")
+def planted(con):
+    """Planted coefficients, plus each subscriber's latent engagement level.
+
+    Tests may read the truth tables; analysis modules may not. The latent level
+    is needed here for the one comparison that matters most on day 4 -- fitting
+    the *same* model on the true regressor instead of its observable proxy.
+    """
+    truth = dict(con.execute("select term, value from hazard_truth").fetchall())
+    latent = dict(
+        con.execute("select subscriber_id, engagement from subscriber_truth").fetchall()
+    )
+    return truth, latent
+
+
+PLANTED_TERM = {
+    "plan_standard": "plan_standard",
+    "plan_premium": "plan_premium",
+    "tenure_log1p": "tenure_log1p",
+    "activity": "engagement",
+}
+
+
+def test_the_fit_recovers_the_planted_signs_and_the_tier_ordering(fitted):
+    """The weakest useful claim, asserted separately from the numeric one.
+
+    Signs and ordering are what a stakeholder actually reads off a driver
+    model -- "premium churns less than standard, which churns less than basic"
+    -- and they survive attenuation, so they can be asserted tightly while the
+    magnitudes cannot.
+    """
+    coefficients = fitted["coefficients"]
+
+    assert all(value < 0 for value in coefficients.values()), coefficients
+    assert coefficients["plan_premium"] < coefficients["plan_standard"] < 0
+    # Engagement is the strongest single lever by construction, and stays so
+    # even after measurement error eats part of it.
+    assert abs(coefficients["activity"]) > abs(coefficients["plan_premium"])
+
+
+def test_fitting_on_the_true_regressor_recovers_every_planted_coefficient(
+    con, rows, planted
+):
+    """The day-4 result: with the true regressor, the model lands on the truth.
+
+    Substituting the latent engagement level for the observed event count --
+    something only a test may do -- makes the specification exactly the one the
+    data was generated from. Every coefficient then comes back within 1.7
+    asymptotic standard errors of its planted value:
+
+        plan_standard  -0.444 vs -0.45   (0.07 se)
+        plan_premium   -0.839 vs -0.95   (0.81 se)
+        tenure_log1p   -0.618 vs -0.55   (1.63 se)
+        engagement     -2.431 vs -2.40   (0.17 se)
+
+    This is the test that separates "the analysis is wrong" from "the data
+    hides the regressor". If this one fails, the model code is broken; the
+    attenuated fit below is the honest consequence of only having a proxy.
+    """
+    truth, latent = planted
+    on_truth = [
+        {**row, "activity": latent[row["subscriber_id"]]} for row in rows
+    ]
+    fitted = drivers.fit_with_features(on_truth)
+    errors = drivers.standard_errors(fitted, on_truth)
+
+    for term, value in fitted["coefficients"].items():
+        expected = truth[PLANTED_TERM[term]]
+        assert value == pytest.approx(expected, abs=3 * errors[term]), (
+            term,
+            value,
+            expected,
+            errors[term],
+        )
+
+    assert fitted["intercept"] == pytest.approx(
+        truth["intercept"], abs=3 * errors["intercept"]
+    )
+
+
+def test_the_observable_proxy_attenuates_the_engagement_effect(con, rows, fitted, planted):
+    """And the day's most useful negative result, with a number on it.
+
+    Fitted on observed activity, the engagement coefficient comes back at
+    -1.368 against a planted -2.40: **57% of the true effect**, and the gap is
+    7.2 times its own standard error (8.4 on the test store), so it is bias
+    rather than sampling noise. Reporting
+    -1.368 as "the engagement effect" would understate the most important lever
+    in the business by nearly half.
+
+    The cause is measurement error in the regressor, and the size is roughly
+    what theory predicts. The classic reliability ratio -- between-subscriber
+    variance over total variance -- is var(e) / (var(e) + E[e]/12) = 0.0489 /
+    (0.0489 + 0.0427) = 0.53 for this dataset, against an observed 0.57. The
+    remaining gap is the logistic link's non-linearity plus the proxy being a
+    single month rather than a subscriber average, which is why this is
+    asserted as a band rather than a point.
+
+    Everything else in the model survives: the plan coefficients and the
+    tenure term stay close to their planted values, because the measurement
+    error is in a regressor roughly orthogonal to them.
+    """
+    truth, latent = planted
+    observed = fitted["coefficients"]["activity"]
+    errors = drivers.standard_errors(fitted, rows)
+
+    ratio = observed / truth["engagement"]
+    assert 0.45 < ratio < 0.70, ratio
+    # Bias, not sampling noise: several standard errors from the truth, where
+    # the latent-regressor fit above sits within one.
+    assert abs(observed - truth["engagement"]) > 5 * errors["activity"]
+
+    # The attenuation is specific to the mismeasured term.
+    for term in ("plan_standard", "plan_premium", "tenure_log1p"):
+        assert fitted["coefficients"][term] == pytest.approx(
+            truth[PLANTED_TERM[term]], abs=0.2
+        ), term
+
+
+def test_standard_errors_scale_down_as_the_dataset_grows(rows, fitted, tmp_path):
+    """se ~ 1/sqrt(n): a quarter of the rows should roughly double them.
+
+    Cheap, and it catches the two ways a hand-written information matrix goes
+    wrong -- a missing weight term or a transposed product -- both of which
+    produce errors that do not scale with n at all.
+    """
+    errors = drivers.standard_errors(fitted, rows)
+    quarter = rows[: len(rows) // 4]
+    small = drivers.fit_with_features(quarter)
+    small_errors = drivers.standard_errors(small, quarter)
+
+    for term, value in errors.items():
+        assert 1.4 < small_errors[term] / value < 3.0, (term, value, small_errors[term])
+
+
 def test_log_loss_beats_the_base_rate_and_accuracy_would_not(rows, fitted):
     """Why the headline metric is log loss and not accuracy.
 

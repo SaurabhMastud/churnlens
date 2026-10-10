@@ -178,6 +178,36 @@ def fit(con: duckdb.DuckDBPyConnection, specification: str = "planted_shape") ->
     return fit_with_features(design_rows(con), FEATURE_SETS[specification])
 
 
+def standard_errors(fitted: dict, rows: list[dict]) -> dict[str, float]:
+    """Asymptotic standard errors for the fitted coefficients.
+
+    scikit-learn is a prediction library and does not return these, which is a
+    reasonable choice for its purpose and a problem for this one: a coefficient
+    without a standard error cannot be compared to a planted value except by
+    eye. They come from the inverse Fisher information for a logistic model,
+
+        cov = (X' W X)^-1,  W = diag(p_i (1 - p_i))
+
+    which is six lines of numpy over the design matrix the fit already used.
+    This is also the honest reason the project does not reach for statsmodels:
+    one matrix inverse is cheaper than a dependency, and the day-1 pins already
+    carried one package nobody had installed.
+
+    Asymptotic, so they are standard errors of the maximum-likelihood estimate
+    and say nothing about whether the specification is right. A misspecified
+    model gets tight errors around the wrong number, which is precisely why the
+    comparison against the planted coefficients exists.
+    """
+    matrix, _ = design_matrix(rows, fitted["features"])
+    with_intercept = np.column_stack([np.ones(len(matrix)), matrix])
+    probability = predicted_hazard(fitted, rows)
+    weights = probability * (1.0 - probability)
+
+    information = with_intercept.T @ (with_intercept * weights[:, None])
+    errors = np.sqrt(np.diag(np.linalg.inv(information)))
+    return dict(zip(("intercept", *fitted["features"]), (float(e) for e in errors)))
+
+
 def predicted_hazard(fitted: dict, rows: list[dict]) -> np.ndarray:
     matrix, _ = design_matrix(rows, fitted["features"])
     return fitted["model"].predict_proba(matrix)[:, 1]
@@ -260,7 +290,9 @@ def render(store: str | Path = DEFAULT_STORE) -> str:
         )
 
     with duckdb.connect(str(store), read_only=True) as con:
-        full = fit(con)
+        rows = design_rows(con)
+        full = fit_with_features(rows)
+        errors = standard_errors(full, rows)
         results = {name: evaluate(con, name) for name in FEATURE_SETS}
 
     lines = [
@@ -271,19 +303,28 @@ def render(store: str | Path = DEFAULT_STORE) -> str:
         "monthly base rate).",
         "Fitted on observable data only: plan, tenure, and that month's event count.",
         "",
-        "term                 coefficient  reads as",
-        "-------------------  -----------  ------------------------------------",
-        f"intercept            {full['intercept']:>11.3f}  baseline log-odds, basic plan at tenure 0",
+        "term             coefficient     se  reads as",
+        "---------------  -----------  -----  -------------------------------------",
+        f"intercept        {full['intercept']:>11.3f}  {errors['intercept']:>5.3f}  "
+        "baseline log-odds, basic at tenure 0",
     ]
     reads = {
-        "plan_standard": "standard vs basic, holding tenure and activity",
-        "plan_premium": "premium vs basic, holding tenure and activity",
+        "plan_standard": "standard vs basic, holding the rest",
+        "plan_premium": "premium vs basic, holding the rest",
         "tenure_log1p": "per log1p(month) of tenure",
         "activity": "per 12 events in the month",
     }
     lines += [
-        f"{term:<19}  {value:>11.3f}  {reads.get(term, '')}"
+        f"{term:<15}  {value:>11.3f}  {errors[term]:>5.3f}  {reads.get(term, '')}"
         for term, value in full["coefficients"].items()
+    ]
+    lines += [
+        "",
+        "Standard errors are asymptotic, from the inverse Fisher information.",
+        "They describe sampling error in the estimate, not whether the model is",
+        "the right one -- a misspecified model gets tight errors around a wrong",
+        "number, which is what the comparison against the planted coefficients",
+        "in the test suite is for.",
     ]
 
     lines += [
