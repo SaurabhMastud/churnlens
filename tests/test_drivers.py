@@ -188,6 +188,30 @@ PLANTED_TERM = {
 }
 
 
+def test_the_fit_actually_reaches_the_maximum_likelihood_estimate(rows, fitted):
+    """Regression test for a real bug: the optimiser was stopping early.
+
+    For a logistic model with an intercept, the score equation for that
+    intercept is `sum(y_i - p_i) = 0` -- the fitted probabilities must add up
+    to the observed number of events exactly. It is the cheapest possible
+    convergence check and it does not need the truth.
+
+    At scikit-learn's default `tol=1e-4`, lbfgs left a residual of **0.98
+    events** on 43,467 rows, and the coefficients it returned were visibly off:
+    `plan_standard` came back at -0.425 where the converged fit gives -0.4516
+    against a planted -0.45. That looked exactly like the analysis failing to
+    recover a coefficient, which is the failure mode this project is built to
+    detect, and it was the optimiser quitting. Tightened to `tol=1e-8`, the
+    residual is ~1e-5 and the recovery test above passes comfortably.
+
+    Tolerance here is 0.01 events, three orders of magnitude inside the bug.
+    """
+    predicted = drivers.predicted_hazard(fitted, rows).sum()
+    observed = sum(row["churned"] for row in rows)
+
+    assert predicted == pytest.approx(observed, abs=0.01), observed - predicted
+
+
 def test_the_fit_recovers_the_planted_signs_and_the_tier_ordering(fitted):
     """The weakest useful claim, asserted separately from the numeric one.
 
@@ -212,13 +236,17 @@ def test_fitting_on_the_true_regressor_recovers_every_planted_coefficient(
 
     Substituting the latent engagement level for the observed event count --
     something only a test may do -- makes the specification exactly the one the
-    data was generated from. Every coefficient then comes back within 1.7
-    asymptotic standard errors of its planted value:
+    data was generated from. Every coefficient then comes back within 1.5
+    asymptotic standard errors of its planted value on this store:
 
-        plan_standard  -0.444 vs -0.45   (0.07 se)
-        plan_premium   -0.839 vs -0.95   (0.81 se)
-        tenure_log1p   -0.618 vs -0.55   (1.63 se)
-        engagement     -2.431 vs -2.40   (0.17 se)
+        plan_standard  -0.569 vs -0.45   (1.49 se)
+        plan_premium   -1.029 vs -0.95   (0.62 se)
+        tenure_log1p   -0.593 vs -0.55   (1.13 se)
+        engagement     -2.382 vs -2.40   (0.12 se)
+        intercept      -1.791 vs -1.90   (1.28 se)
+
+    On the committed 4000-subscriber store the same fit gives 0.03 / 0.85 /
+    1.62 / 0.14 / 0.83 se, so the tolerance of 3 se is not tuned to one store.
 
     This is the test that separates "the analysis is wrong" from "the data
     hides the regressor". If this one fails, the model code is broken; the
@@ -249,9 +277,9 @@ def test_the_observable_proxy_attenuates_the_engagement_effect(con, rows, fitted
     """And the day's most useful negative result, with a number on it.
 
     Fitted on observed activity, the engagement coefficient comes back at
-    -1.368 against a planted -2.40: **57% of the true effect**, and the gap is
-    7.2 times its own standard error (8.4 on the test store), so it is bias
-    rather than sampling noise. Reporting
+    -1.383 against a planted -2.40: **58% of the true effect**, and the gap is
+    8.3 times its own standard error (7.0 on the committed store), so it is
+    bias rather than sampling noise. Reporting
     -1.368 as "the engagement effect" would understate the most important lever
     in the business by nearly half.
 

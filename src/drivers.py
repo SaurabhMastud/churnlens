@@ -153,10 +153,21 @@ def fit_with_features(
     way to write it, works, and emits a `FutureWarning` on scikit-learn 1.8+
     saying the argument is going away in 1.10. Both forms were run and give
     identical coefficients to 1e-12, so this is the same fit written the way
-    that will still exist. `lbfgs` converges on this scale without scaling.
+    that will still exist.
+
+    `tol=1e-8` rather than the default 1e-4, and this one was a real bug rather
+    than a preference. At the default, lbfgs stops *short of the maximum
+    likelihood estimate*: the score equation for the intercept requires
+    `sum(y - p) = 0`, and the default fit left a residual of 0.98 churn events
+    on 43,467 rows. The coefficients it returned were visibly off --
+    `plan_standard` came back at -0.425 where the converged fit gives -0.4516
+    against a planted -0.45 -- so the under-converged estimate looked like a
+    small recovery failure in the analysis when it was the optimiser quitting
+    early. `newton-cholesky` converges to the same place; lbfgs at a tighter
+    tolerance is the smaller change. The score identity is now a test.
     """
     matrix, outcome = design_matrix(rows, features)
-    model = LogisticRegression(C=np.inf, max_iter=2000)
+    model = LogisticRegression(C=np.inf, max_iter=2000, tol=1e-8)
     model.fit(matrix, outcome)
 
     return {
