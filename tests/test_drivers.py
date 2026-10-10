@@ -422,6 +422,97 @@ def test_the_correctly_specified_model_wins_on_held_out_log_loss(rows, seed):
     assert 0.0 < relative < 0.02, relative
 
 
+def test_the_model_is_calibrated_on_held_out_subscribers(rows):
+    """Calibration, which AUC is completely blind to.
+
+    Multiply every predicted hazard by three and the AUC does not move -- the
+    ranking is unchanged -- while every number that anyone would act on becomes
+    wrong. So the deciles of predicted risk are compared with the churn rate
+    actually observed in them, on subscribers the model never saw.
+
+    Read against the binomial standard error of the observed rate, since a
+    decile holding 20 churn events cannot pin a rate tightly: the worst decile
+    gap is about 2 se and most are under 1. The 3.5 se bound is what that
+    supports, not a target.
+    """
+    train, test = drivers.split_by_subscriber(rows)
+    fitted = drivers.fit_with_features(train)
+    deciles = drivers.calibration(fitted, test)
+
+    assert len(deciles) == 10
+    assert sum(row["rows"] for row in deciles) == len(test)
+    for row in deciles:
+        gap = abs(row["observed"] - row["predicted"]) / row["se"]
+        assert gap < 3.5, row
+
+    # And the ranking still has to be real: the top decile churns several
+    # times as often as the bottom one.
+    assert deciles[-1]["observed"] > 5 * deciles[0]["observed"]
+
+
+def test_rescaling_the_predictions_keeps_the_auc_and_breaks_calibration(rows, fitted):
+    """The mutation that shows the calibration test is doing work.
+
+    Tripling every predicted hazard leaves the AUC identical to 12 decimal
+    places and blows the calibration check apart. Without this, the previous
+    test could be passing because the metric is insensitive rather than because
+    the model is calibrated.
+    """
+    inflated = dict(fitted)
+    original = drivers.predicted_hazard
+
+    try:
+        drivers.predicted_hazard = lambda f, r: np.clip(original(f, r) * 3.0, 0, 1)
+        assert drivers.auc(inflated, rows) == pytest.approx(
+            drivers.auc(fitted, rows), abs=1e-12
+        )
+        worst = max(
+            abs(row["observed"] - row["predicted"]) / row["se"]
+            for row in drivers.calibration(inflated, rows)
+        )
+        assert worst > 10, worst
+    finally:
+        drivers.predicted_hazard = original
+
+
+def test_one_tenure_coefficient_reproduces_the_whole_observed_hazard_curve(con, rows, fitted):
+    """Cross-module check against day 3, and a real constraint on the fit.
+
+    Tenure enters the model through a single `log1p` coefficient -- there is no
+    per-month dummy -- so matching the observed hazard month by month is not a
+    restatement of the data. The widest gap on the committed store is 0.69
+    percentage points at tenure 14, where the month holds 1327 rows.
+
+    The observed column is also asserted to equal day 3's risk table exactly.
+    Both compute "churn events over subscriber-months at risk" from the same
+    store by different routes (numpy over the design rows, SQL over
+    `subscription_months`), and the two agreeing to floating-point equality is
+    what says the design matrix covers the same risk set the survival analysis
+    does.
+    """
+    from src import survival
+
+    curve = drivers.hazard_by_tenure(fitted, rows)
+    km = {row["tenure"]: row["hazard"] for row in survival.kaplan_meier(con)}
+
+    assert [row["tenure"] for row in curve] == sorted(km)
+    for row in curve:
+        assert row["observed"] == pytest.approx(km[row["tenure"]], abs=1e-12)
+
+    # Predicted tracks observed everywhere the month is not tiny.
+    for row in curve:
+        if row["rows"] < 300:
+            continue
+        assert abs(row["predicted"] - row["observed"]) < 0.01, row
+
+    # And the implied survival curve lands on the KM one.
+    implied, observed = 1.0, 1.0
+    for row in curve:
+        implied *= 1.0 - row["predicted"]
+        observed *= 1.0 - row["observed"]
+    assert implied == pytest.approx(observed, abs=0.02)
+
+
 def test_auc_is_modest_and_that_is_the_expected_result(rows, fitted):
     """A correctly specified model on this data scores around 0.70.
 

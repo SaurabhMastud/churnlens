@@ -36,6 +36,7 @@ reads `hazard_truth` or `subscriber_truth`; the contract test enforces it.
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import duckdb
@@ -251,6 +252,69 @@ def _outcome(rows: list[dict]) -> np.ndarray:
     return np.array([row["churned"] for row in rows])
 
 
+def calibration(fitted: dict, rows: list[dict], bins: int = 10) -> list[dict]:
+    """Observed churn rate against predicted hazard, in bins of predicted risk.
+
+    Discrimination (AUC) and calibration are different properties and a model
+    can have one without the other: multiply every predicted hazard by three
+    and the AUC does not move at all, while the numbers become useless for
+    anything that acts on them -- a retention budget, an expected-loss
+    estimate, a list of who to call. Only calibration catches that.
+
+    Equal-count bins rather than equal-width. The predicted hazards here are
+    heavily skewed toward the low end (most subscriber-months are safe), so
+    equal-width bins would put almost every row in the first bucket and leave
+    the interesting tail with too few events to say anything about.
+    """
+    probability = predicted_hazard(fitted, rows)
+    outcome = _outcome(rows)
+    order = np.argsort(probability, kind="mergesort")
+
+    out = []
+    for index, chunk in enumerate(np.array_split(order, bins), start=1):
+        observed = float(outcome[chunk].mean())
+        out.append(
+            {
+                "bin": index,
+                "rows": len(chunk),
+                "events": int(outcome[chunk].sum()),
+                "predicted": float(probability[chunk].mean()),
+                "observed": observed,
+                # Binomial se on the observed rate, which is what the comparison
+                # has to be read against: a decile holding 20 churn events
+                # cannot pin a rate to better than ~20%.
+                "se": math.sqrt(max(observed * (1.0 - observed), 1e-12) / len(chunk)),
+            }
+        )
+    return out
+
+
+def hazard_by_tenure(fitted: dict, rows: list[dict]) -> list[dict]:
+    """Mean predicted hazard against the observed rate, per tenure month.
+
+    The model never sees a tenure dummy -- tenure enters only through one
+    `log1p` coefficient -- so reproducing the observed per-month hazard curve
+    is a real constraint on that single parameter rather than a restatement of
+    the data. This is also the quantity day 1's report and day 3's risk table
+    compute independently, which makes it the natural cross-module check.
+    """
+    probability = predicted_hazard(fitted, rows)
+    outcome = _outcome(rows)
+
+    tenures = np.array([row["tenure"] for row in rows])
+    return [
+        {
+            "tenure": int(tenure),
+            "rows": int(mask.sum()),
+            "predicted": float(probability[mask].mean()),
+            "observed": float(outcome[mask].mean()),
+        }
+        for tenure, mask in (
+            (tenure, tenures == tenure) for tenure in sorted(set(tenures.tolist()))
+        )
+    ]
+
+
 def split_by_subscriber(
     rows: list[dict], holdout: float = 0.3, seed: int = 11
 ) -> tuple[list[dict], list[dict]]:
@@ -349,6 +413,43 @@ def render(store: str | Path = DEFAULT_STORE) -> str:
     lines += [
         f"{name:<16}  {result['test_log_loss']:>13.4f}  {result['test_auc']:>8.3f}"
         for name, result in results.items()
+    ]
+
+    train, test = split_by_subscriber(rows)
+    held = fit_with_features(train, FEATURE_SETS["planted_shape"])
+    lines += [
+        "",
+        "Calibration on held-out subscribers, by decile of predicted risk.",
+        "AUC says the ranking is right; only this says the numbers are usable",
+        "for anything that acts on them (a budget, an expected-loss estimate).",
+        "",
+        "decile    rows  events  predicted  observed   gap",
+        "------  ------  ------  ---------  --------  ----",
+    ]
+    lines += [
+        f"{row['bin']:>6}  {row['rows']:>6}  {row['events']:>6}  "
+        f"{row['predicted']:>9.2%}  {row['observed']:>8.2%}  "
+        f"{(row['observed'] - row['predicted']) / row['se']:>+4.1f}se"
+        for row in calibration(held, test)
+    ]
+
+    tenure_fit = hazard_by_tenure(full, rows)
+    worst = max(tenure_fit, key=lambda row: abs(row["predicted"] - row["observed"]))
+    lines += [
+        "",
+        "Predicted vs observed monthly hazard by tenure. Tenure enters the model",
+        "through a single log1p coefficient -- there is no per-month dummy -- so",
+        "tracking the observed curve is a constraint, not a restatement. The",
+        f"widest gap is {abs(worst['predicted'] - worst['observed']):.2%} at tenure "
+        f"{worst['tenure']} ({worst['rows']} rows).",
+        "",
+        "tenure    rows  predicted  observed",
+        "------  ------  ---------  --------",
+    ]
+    lines += [
+        f"{row['tenure']:>6}  {row['rows']:>6}  {row['predicted']:>9.2%}  "
+        f"{row['observed']:>8.2%}"
+        for row in tenure_fit[:13]
     ]
 
     planted = results["planted_shape"]
