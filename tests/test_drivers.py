@@ -319,6 +319,81 @@ def test_log_loss_beats_the_base_rate_and_accuracy_would_not(rows, fitted):
     assert 1.0 - base_rate > 0.98
 
 
+def _row_split(rows, holdout=0.3, seed=11):
+    """A deliberately wrong split: random rows, ignoring subscriber identity."""
+    order = np.random.default_rng(seed).permutation(len(rows))
+    cut = int(len(rows) * (1.0 - holdout))
+    return [rows[i] for i in order[:cut]], [rows[i] for i in order[cut:]]
+
+
+def test_the_row_split_leak_is_real_in_principle_and_small_here(rows):
+    """An honest negative result, and the reason it is still a test.
+
+    The rule "split panel data by group, not by row" is right, and the first
+    measurement of it looked like a textbook confirmation: on seed 11 the row
+    split scored AUC 0.711 against 0.680 for the subscriber split, a three
+    point inflation. Averaged over five seeds, though, the gap is **0.0025**
+    against a between-seed standard deviation of 0.014 -- so that first number
+    was the split lottery, not leakage.
+
+    The explanation is capacity. This model has four parameters and no
+    subscriber-level feature to memorise: seeing some of a subscriber's months
+    in training tells it almost nothing about their remaining months beyond
+    what plan and activity already say. A model with room to memorise does pick
+    up a consistent gain from the row split -- a random forest handed the
+    subscriber id gained 0.004-0.017 AUC across three seeds -- but that is a
+    weak effect measured on three seeds and is not asserted here.
+
+    So the split stays by subscriber, because it is free and the harm grows
+    with capacity; and the claim stays "small for this model on this data",
+    because that is what was measured.
+    """
+    by_subscriber, by_row = [], []
+    for seed in (11, 12, 13, 14, 15):
+        train, test = drivers.split_by_subscriber(rows, seed=seed)
+        by_subscriber.append(drivers.auc(drivers.fit_with_features(train), test))
+        train, test = _row_split(rows, seed=seed)
+        by_row.append(drivers.auc(drivers.fit_with_features(train), test))
+
+    gap = float(np.mean(by_row) - np.mean(by_subscriber))
+    noise = float(np.std(by_subscriber))
+
+    assert abs(gap) < 2 * noise, (gap, noise)
+    # Both splits still produce a usable model -- this is a test about the
+    # evaluation, not about the fit falling over.
+    assert min(by_subscriber) > 0.6 and min(by_row) > 0.6
+
+
+@pytest.mark.parametrize("seed", [11, 12, 13])
+def test_the_correctly_specified_model_wins_on_held_out_log_loss(rows, seed):
+    """Specification comparison, which is only meaningful because truth exists.
+
+    Three specifications, scored on held-out subscribers: the planted shape
+    (`log1p` tenure plus activity), a linear tenure term, and no activity term
+    at all. The planted shape wins on log loss in all five seeds tried, and the
+    margins are small but consistently ordered -- 0.0835 / 0.0837 / 0.0845 on
+    seed 12, for instance.
+
+    The small margin is the finding worth keeping. Misspecifying the tenure
+    term costs about 0.4% of log loss, which no amount of staring at a
+    validation score would ever flag as wrong, while the *coefficient* on a
+    linear tenure term means something quite different from the planted one.
+    Predictive scoring is a weak instrument for specification error, which is
+    the case for having ground truth rather than only a holdout.
+    """
+    train, test = drivers.split_by_subscriber(rows, seed=seed)
+    scores = {
+        name: drivers.log_loss(drivers.fit_with_features(train, features), test)
+        for name, features in drivers.FEATURE_SETS.items()
+    }
+
+    assert min(scores, key=scores.get) == "planted_shape", scores
+    assert scores["no_activity"] > scores["planted_shape"]
+    # And the misspecification is cheap enough to be invisible in practice.
+    relative = scores["linear_tenure"] / scores["planted_shape"] - 1.0
+    assert 0.0 < relative < 0.02, relative
+
+
 def test_auc_is_modest_and_that_is_the_expected_result(rows, fitted):
     """A correctly specified model on this data scores around 0.70.
 
