@@ -53,6 +53,7 @@ src/store.py        DuckDB load, including hazard_truth
 src/report.py       read-only sanity report (churn by plan, hazard by tenure)
 src/cohorts.py      signup-cohort retention matrix, pooled and per-plan curves
 src/survival.py     Kaplan-Meier survival, log-rank comparison between plans
+src/drivers.py      churn-driver model: coefficients, calibration, held-out scores
 tests/              pytest suite
 docs/               architecture notes + the day-7 reports
 data/               local DuckDB store (git-ignored)
@@ -66,6 +67,7 @@ python -m src.store            # generate lifecycles and load data/churnlens.duc
 python -m src.report           # read-only sanity report over the store
 python -m src.cohorts          # signup-cohort retention matrix + retention curves
 python -m src.survival         # Kaplan-Meier curve, median, log-rank across plans
+python -m src.drivers          # churn drivers: coefficients, calibration, held-out scores
 python -m src.hazard           # hazard model self-check
 python -m pytest tests/ -q
 ```
@@ -158,6 +160,57 @@ the shorter the window, since a shorter window censors more people. Counting
 the end of observation as an exit, or keeping only subscribers with an observed
 churn, both collapse survival to 0.0%. All three are tests.
 
+## Churn drivers (day 4)
+
+`python -m src.drivers` fits a discrete-time logistic hazard on subscriber-months
+— the unit the generator actually draws churn on — using only observable data:
+plan, tenure, and that month's event count.
+
+```
+term             coefficient     se   planted
+intercept             -2.290  0.092    -1.90
+plan_standard         -0.452  0.092    -0.45
+plan_premium          -0.813  0.137    -0.95
+tenure_log1p          -0.625  0.041    -0.55
+activity              -1.394  0.144    -2.40   <- attenuated
+```
+
+The `planted` column is not in the program's output — an analysis here may not
+read the truth — but the test suite makes the comparison, and it is where the
+day's two results come from:
+
+1. **Fitted on the true regressor, the model recovers everything.** Substituting
+   the latent engagement level for the observed event count (something only a
+   test may do) puts every coefficient within 1.5 standard errors of its
+   planted value, intercept included.
+2. **Fitted on the observable proxy, the engagement effect attenuates to 58%
+   of the truth** — −1.383 against −2.40, 8.3 standard errors away, so bias
+   rather than noise. The size matches the classic reliability ratio (0.53
+   predicted, 0.58 observed). Reporting −1.4 as "the engagement effect" would
+   understate the business's biggest lever by nearly half, and nothing in the
+   fit's own diagnostics would say so.
+
+The evaluation is deliberately unglamorous. Held-out AUC is **0.680**, and an
+upper bound is asserted as well as a lower one: the planted hazard sits close
+to the base rate for most subscriber-months, so an AUC above 0.9 would be
+evidence of leakage rather than skill. Log loss rather than accuracy, since
+"nobody churns" is 98.4% accurate here. Calibration is checked separately,
+because tripling every prediction leaves AUC identical to 12 decimal places
+and makes every number unusable.
+
+Two findings worth keeping from the day:
+
+- **scikit-learn's default tolerance stopped the fit short of the maximum
+  likelihood estimate.** `sum(y - p) = 0` is required at the optimum; the
+  default left a residual of 0.98 events and `plan_standard` at −0.425 instead
+  of −0.452. It looked exactly like the analysis failing to recover a
+  coefficient. `tol=1e-8` fixes it and the identity is now a test.
+- **The row-split leak is real in principle and small here.** A random row
+  split scored 0.711 against 0.680 on the first seed tried — then 0.0025
+  averaged over five, against a between-seed sd of 0.014. Four parameters leave
+  nothing to memorise. The split stays by subscriber anyway; the claim in the
+  test is the measured one.
+
 ## Data model
 
 | Table | Grain | What it holds |
@@ -189,11 +242,13 @@ problem, not a lookup.
 
 ## Status
 
-Day 3 of 7. The hazard model, the lifecycle generator with correct censoring,
-the DuckDB load, the sanity report, cohort retention and Kaplan–Meier survival
-are in place and tested. Every analysis so far lands on the process it was
-drawn from: a 3.920% predicted first-month hazard against 3.833% observed (0.34
-binomial se), cohort retention within 4 se of the planted survival function at
-every tenure checked, and the KM curve within 0.17–2.18 se of it across three
-seeds. The churn-driver model — does a fitted model recover the planted
-coefficients and their ordering — is day 4.
+Day 4 of 7. The hazard model, the lifecycle generator with correct censoring,
+the DuckDB load, the sanity report, cohort retention, Kaplan–Meier survival and
+the churn-driver model are in place and tested. Every analysis lands on the
+process it was drawn from: a 3.920% predicted first-month hazard against 3.833%
+observed, cohort retention and the KM curve both within a few standard errors
+of the planted survival function, and the driver model recovering every planted
+coefficient within 1.5 se when given the true regressor — plus a measured 58%
+attenuation when given only the observable proxy, which is the most useful
+thing the week has produced. Segment deep-dives and LTV are day 5, the
+Streamlit dashboard day 6, and both reports day 7.
