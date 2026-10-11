@@ -99,8 +99,14 @@ def risk_table(
     ]
 
 
-def _accumulate(rows: list[dict]) -> list[dict]:
+def accumulate(rows: list[dict]) -> list[dict]:
     """Walk a risk table in tenure order, folding in survival and its error.
+
+    Public rather than private because `src/segments.py` builds its own risk
+    tables -- segmented by a subscriber-level attribute this module's SQL does
+    not reach -- and feeds them through here. One accumulator means the
+    Greenwood variance and the interval transform exist once; a second copy in
+    the segment module would be the obvious place for the two to drift.
 
     Greenwood's formula for the variance of S(t):
 
@@ -158,7 +164,7 @@ def _loglog_ci(survival: float, greenwood: float) -> tuple[float, float]:
 
 def kaplan_meier(con: duckdb.DuckDBPyConnection) -> list[dict]:
     """Pooled KM curve: one row per tenure month, in order."""
-    return _accumulate(risk_table(con))
+    return accumulate(risk_table(con))
 
 
 def kaplan_meier_by_segment(
@@ -171,7 +177,7 @@ def kaplan_meier_by_segment(
     grouped: dict[str, list[dict]] = {}
     for row in risk_table(con, segment):
         grouped.setdefault(row[segment], []).append(row)
-    return {level: _accumulate(rows) for level, rows in sorted(grouped.items())}
+    return {level: accumulate(rows) for level, rows in sorted(grouped.items())}
 
 
 def median_survival(curve: list[dict]) -> int | None:

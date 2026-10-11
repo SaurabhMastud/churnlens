@@ -154,7 +154,7 @@ def test_a_month_with_no_churn_leaves_survival_and_the_interval_alone():
         {"tenure": 1, "at_risk": 90, "events": 0, "censored": 0},
         {"tenure": 2, "at_risk": 90, "events": 9, "censored": 0},
     ]
-    curve = survival._accumulate(rows)
+    curve = survival.accumulate(rows)
 
     assert curve[0]["survival"] == pytest.approx(0.9)
     assert curve[1]["survival"] == pytest.approx(curve[0]["survival"])
@@ -264,8 +264,8 @@ def test_treating_censored_subscribers_as_churn_destroys_the_curve(con):
         for row in table
     ]
 
-    correct = survival._accumulate(table)[-1]["survival"]
-    broken = survival._accumulate(mutated)[-1]["survival"]
+    correct = survival.accumulate(table)[-1]["survival"]
+    broken = survival.accumulate(mutated)[-1]["survival"]
 
     assert correct > 0.7
     assert broken < 0.01, broken
