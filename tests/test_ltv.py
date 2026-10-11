@@ -12,7 +12,7 @@ import math
 import duckdb
 import pytest
 
-from src import ltv, store, survival
+from src import ltv, segments, store, survival
 
 BUILD = dict(count=6000, window_months=18, seed=67)
 
@@ -224,3 +224,66 @@ def test_ltv_cli_accepts_a_price_override(built, capsys):
 def test_ltv_cli_rejects_an_unknown_plan_price(built):
     with pytest.raises(SystemExit):
         ltv.main(["--store", str(built), "--price", "gold=5"])
+
+
+def test_the_value_grid_partitions_the_subscriber_population(con):
+    """Every (plan, segment) cell, and no subscriber counted twice.
+
+    The grid is built by running the segment query once per plan, so the
+    failure to watch for is a cell silently missing or a subscriber appearing
+    in two cells -- which is what would happen if the activity quantiles were
+    recomputed within each plan while the labels stayed the same.
+    """
+    grid = ltv.by_plan_and_activity(con, horizon=12)
+    total = con.execute("select count(*) from subscribers").fetchone()[0]
+
+    assert sum(row["at_risk"] for row in grid) == total
+    assert len({(row["plan"], row["segment"]) for row in grid}) == len(grid)
+    assert len(grid) == 3 * 4
+
+
+def test_the_pricing_lever_beats_the_retention_lever_at_a_short_horizon(con):
+    """The day-5 result that is easy to get backwards.
+
+    Activity moves *retention* further than plan does -- that is the segment
+    report's finding, and it is what the planted coefficients say. It does not
+    follow that activity moves *value* further, and at a 12-month horizon it
+    does not: plan is worth 4.5x from cheapest to dearest at top activity,
+    while the whole activity range inside basic is worth 1.1x. Value multiplies
+    by price, retention only buys months, and the horizon caps the months.
+
+    Asserted because the two reports otherwise look contradictory, and a reader
+    who notices should find the distinction already made rather than have to
+    work out which number to trust.
+    """
+    grid = {(row["plan"], row["segment"]): row["value"] for row in ltv.by_plan_and_activity(con, 12)}
+
+    plan_lever = grid[("premium", "A4")] / grid[("basic", "A4")]
+    activity_lever = grid[("basic", "A4")] / grid[("basic", "A1")]
+
+    assert plan_lever > 3 * activity_lever, (plan_lever, activity_lever)
+    # The retention ordering still holds inside every plan, though: it is the
+    # size of the effect on value that is small, not its direction.
+    for plan in ("basic", "standard", "premium"):
+        assert grid[(plan, "A4")] > grid[(plan, "A1")], plan
+
+
+def test_the_grid_uses_the_baseline_cut_not_the_look_ahead_one(con):
+    """A value table built on the lifetime-average segment would be a number
+    partly derived from the outcome it claims to predict. Checked by comparing
+    the grid's cell sizes with the baseline segment assignment, which the
+    look-ahead cut does not reproduce."""
+    grid = ltv.by_plan_and_activity(con, horizon=12)
+    baseline = {
+        (plan, segment): count
+        for plan, segment, count in con.execute(
+            f"""
+            with levels as ({segments._activity_sql("baseline", 4)})
+            select s.plan, levels.segment, count(*)
+            from subscribers s join levels using (subscriber_id)
+            group by 1, 2
+            """
+        ).fetchall()
+    }
+
+    assert {(row["plan"], row["segment"]): row["at_risk"] for row in grid} == baseline

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import duckdb
 
-from src import survival
+from src import segments, survival
 from src.store import DEFAULT_STORE
 
 # A stated assumption, not a measurement. Monthly list price per plan.
@@ -130,6 +130,53 @@ def by_plan(
     return out
 
 
+def by_plan_and_activity(
+    con: duckdb.DuckDBPyConnection,
+    horizon: int = 12,
+    discount: float = DEFAULT_DISCOUNT,
+    prices: dict[str, float] | None = None,
+    groups: int = segments.DEFAULT_GROUPS,
+) -> list[dict]:
+    """Restricted value per (plan, activity segment) -- where the value sits.
+
+    The two levers a subscription business actually has are priced differently:
+    plan is a pricing decision, activity is a product decision, and this is the
+    table that says which one is worth more at the margin. Both are needed,
+    because they do not move value the same way -- plan multiplies the price
+    while activity multiplies the months.
+
+    Segments come from `src/segments`, which means the **baseline** cut: the
+    first month's activity, known at signup. Using the lifetime-average cut
+    here would be worse than it is in a retention table, because the segment
+    would then partly encode the very survival the value is computed from --
+    a high-value segment by construction, and a number someone might set a
+    budget against.
+
+    A cell whose curve does not reach the horizon is skipped rather than
+    extrapolated, same rule as `by_plan`. Each row carries its `at_risk` count
+    so a caller can tell a cell backed by 1000 subscribers from one backed by
+    40 -- a 12-month expected value from a thin risk set is arithmetic rather
+    than an estimate, and nothing here can tell the difference for you.
+    """
+    prices = prices or MONTHLY_PRICE
+    out = []
+    for plan in sorted(prices):
+        curves = segments.survival_by_activity(con, "baseline", groups, plan)
+        for segment, curve in sorted(curves.items()):
+            if len(curve) < horizon:
+                continue
+            out.append(
+                {
+                    "plan": plan,
+                    "segment": segment,
+                    "at_risk": curve[0]["at_risk"],
+                    "value": restricted_value(curve, prices[plan], horizon, discount),
+                    "survival_at_horizon": curve[horizon - 1]["survival"],
+                }
+            )
+    return out
+
+
 def render(
     store: str | Path = DEFAULT_STORE,
     horizon: int = 12,
@@ -147,6 +194,13 @@ def render(
         discounted = by_plan(con, horizon, 0.01, prices)
         pooled = survival.kaplan_meier(con)
         curves = survival.kaplan_meier_by_segment(con, "plan")
+        grid = by_plan_and_activity(con, horizon, 0.0, prices)
+
+    cells = {(row["plan"], row["segment"]): row for row in grid}
+    segment_names = sorted({row["segment"] for row in grid})
+    plans_in_grid = sorted(
+        {row["plan"] for row in grid}, key=lambda plan: prices[plan]
+    )
 
     lines = [
         f"Restricted subscriber value -- {store}",
@@ -211,6 +265,55 @@ def render(
         "",
         "Every figure scales linearly in price, so a wrong price assumption",
         "moves the whole table and not the ordering.",
+        "",
+        f"Where the value sits: {horizon}-month value by plan and baseline",
+        "activity segment -- first-month activity, known at signup. The",
+        "lifetime-average cut would be worse here than in a retention table,",
+        "since the segment would partly encode the survival the value is",
+        "computed from, and this is a number someone might budget against.",
+        "",
+        "plan      " + "".join(f"{segment:>9}" for segment in segment_names),
+        "--------  " + "".join("  -------" for _ in segment_names),
+    ]
+    lines += [
+        f"{plan:<8}  "
+        + "".join(
+            f"{cells[(plan, segment)]['value']:>8.0f} "
+            if (plan, segment) in cells
+            else " " * 9
+            for segment in segment_names
+        )
+        for plan in plans_in_grid
+    ]
+
+    best = max(grid, key=lambda row: row["value"])
+    worst = min(grid, key=lambda row: row["value"])
+    top = segment_names[-1]
+    plan_lever = max(
+        cells[(plan, top)]["value"] for plan in plans_in_grid
+    ) / min(cells[(plan, top)]["value"] for plan in plans_in_grid)
+    cheapest = plans_in_grid[0]
+    activity_lever = max(
+        cells[(cheapest, segment)]["value"] for segment in segment_names
+    ) / min(cells[(cheapest, segment)]["value"] for segment in segment_names)
+
+    lines += [
+        "",
+        f"Best cell {best['plan']}/{best['segment']} at {best['value']:.0f}; worst "
+        f"{worst['plan']}/{worst['segment']} at {worst['value']:.0f} -- a "
+        f"{best['value'] / worst['value']:.1f}x spread.",
+        f"The two levers are not the same size. At {top}, moving between plans is",
+        f"worth {plan_lever:.1f}x; inside {cheapest}, moving from {segment_names[0]} to {top}",
+        f"is worth {activity_lever:.1f}x. Plan multiplies the price, activity multiplies",
+        f"the months -- and over {horizon} months there are only so many months to win,",
+        "which is why the pricing lever dominates at this horizon and would",
+        "dominate less at a longer one.",
+        "",
+        "That reverses the retention picture on purpose, and both are right:",
+        "`src/segments` shows activity moving retention further than plan does",
+        "(18.7 points against 7.4), while here plan moves value further. Value",
+        "multiplies by price; retention can only buy months, and the horizon",
+        "caps how many there are to buy.",
     ]
     return "\n".join(lines)
 
