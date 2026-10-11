@@ -54,6 +54,8 @@ src/report.py       read-only sanity report (churn by plan, hazard by tenure)
 src/cohorts.py      signup-cohort retention matrix, pooled and per-plan curves
 src/survival.py     Kaplan-Meier survival, log-rank comparison between plans
 src/drivers.py      churn-driver model: coefficients, calibration, held-out scores
+src/segments.py     survival by observed-activity segment, honest vs look-ahead cut
+src/ltv.py          restricted expected value by plan and segment
 tests/              pytest suite
 docs/               architecture notes + the day-7 reports
 data/               local DuckDB store (git-ignored)
@@ -68,6 +70,8 @@ python -m src.report           # read-only sanity report over the store
 python -m src.cohorts          # signup-cohort retention matrix + retention curves
 python -m src.survival         # Kaplan-Meier curve, median, log-rank across plans
 python -m src.drivers          # churn drivers: coefficients, calibration, held-out scores
+python -m src.segments         # survival by activity segment (and the naive cut beside it)
+python -m src.ltv              # restricted expected value, by plan and activity segment
 python -m src.hazard           # hazard model self-check
 python -m pytest tests/ -q
 ```
@@ -211,6 +215,52 @@ Two findings worth keeping from the day:
   nothing to memorise. The split stays by subscriber anyway; the claim in the
   test is the measured one.
 
+## Segments and value (day 5)
+
+Two reports, and between them the day's lesson: the same data answers "who
+retains" and "who is worth more" differently.
+
+`python -m src.segments` splits survival by observed activity. The interesting
+part is the segment *definition*. Grouping subscribers by their average
+activity over all observed months is the natural phrasing and it looks into the
+future - those months exist only because the subscriber had not churned yet, so
+the segment is partly the outcome. Segmenting on **first-month activity**, a
+covariate known at signup, is the honest version. Both are printed:
+
+```
+segment  at risk  baseline cut  lifetime cut (naive)
+     A1     1000        73.5%                68.1%
+     A4     1000        88.0%                90.4%
+```
+
+The naive cut inflates the top-to-bottom gap by 1.54x on this store - and by
+1.13x-1.31x on three other configurations, since a longer window gives the
+lifetime average more months in which to encode survival. The spread of that
+ratio is in the test, not just the headline number.
+
+`python -m src.ltv` turns the curves into money, with two rules. The horizon is
+part of the figure - survival is still 75.9% when the window closes, so a
+"lifetime" number would be extrapolation - and a horizon longer than the data
+is refused rather than extrapolated silently. Prices are a stated assumption.
+
+```
+plan      S(12mo)   value   value @1%/mo   price/churn   error
+basic       77.9%      94             89            97  +3.6%
+premium     89.3%     439            416           446  +1.5%
+```
+
+`price / churn_rate` is where most LTV estimates come from. Truncated to the
+same horizon it over-states value by 1.5-3.6%, because the pooled rate averages
+a hazard that runs from 4.2% down to 1.3%. Unbounded - the form actually quoted
+- it implies expected lifetimes of 50 to 113 months against 24 months of
+observation.
+
+The value grid reverses the retention finding, and both are right: activity
+moves retention further than plan does (18.7 points against 7.4), while plan
+moves value further (4.5x against 1.1x at a 12-month horizon). Value multiplies
+by price; retention can only buy months, and the horizon caps how many there
+are to buy.
+
 ## Data model
 
 | Table | Grain | What it holds |
@@ -242,7 +292,7 @@ problem, not a lookup.
 
 ## Status
 
-Day 4 of 7. The hazard model, the lifecycle generator with correct censoring,
+Day 5 of 7. The hazard model, the lifecycle generator with correct censoring,
 the DuckDB load, the sanity report, cohort retention, Kaplan–Meier survival and
 the churn-driver model are in place and tested. Every analysis lands on the
 process it was drawn from: a 3.920% predicted first-month hazard against 3.833%
@@ -250,5 +300,6 @@ observed, cohort retention and the KM curve both within a few standard errors
 of the planted survival function, and the driver model recovering every planted
 coefficient within 1.5 se when given the true regressor — plus a measured 58%
 attenuation when given only the observable proxy, which is the most useful
-thing the week has produced. Segment deep-dives and LTV are day 5, the
-Streamlit dashboard day 6, and both reports day 7.
+thing the week has produced. Segment deep-dives and restricted LTV landed on day 5,
+including a measured look-ahead bias and a value grid. The Streamlit dashboard
+is day 6 and both reports are day 7.
