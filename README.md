@@ -56,6 +56,7 @@ src/survival.py     Kaplan-Meier survival, log-rank comparison between plans
 src/drivers.py      churn-driver model: coefficients, calibration, held-out scores
 src/segments.py     survival by observed-activity segment, honest vs look-ahead cut
 src/ltv.py          restricted expected value by plan and segment
+dashboard/app.py    Streamlit dashboard over all of the above
 tests/              pytest suite
 docs/               architecture notes + the day-7 reports
 data/               local DuckDB store (git-ignored)
@@ -72,6 +73,7 @@ python -m src.survival         # Kaplan-Meier curve, median, log-rank across pla
 python -m src.drivers          # churn drivers: coefficients, calibration, held-out scores
 python -m src.segments         # survival by activity segment (and the naive cut beside it)
 python -m src.ltv              # restricted expected value, by plan and activity segment
+streamlit run dashboard/app.py # the dashboard (set CHURNLENS_STORE to point it elsewhere)
 python -m src.hazard           # hazard model self-check
 python -m pytest tests/ -q
 ```
@@ -261,6 +263,39 @@ moves value further (4.5x against 1.1x at a 12-month horizon). Value multiplies
 by price; retention can only buy months, and the horizon caps how many there
 are to buy.
 
+## Dashboard (day 6)
+
+```bash
+streamlit run dashboard/app.py
+```
+
+Five tabs -- cohort retention, survival, churn drivers, segments, value -- over
+the same functions the CLI reports use. The dashboard contains **no SQL of its
+own**: a query written twice can disagree with itself, and the copy in a
+dashboard is the one nobody tests. It opens the store read-only, reads the
+store path from `CHURNLENS_STORE` if set, and never touches the truth tables
+(the contract guard discovers `dashboard/` automatically).
+
+The caveats are on the page, not in a footnote: blank retention cells are
+explained where they are shown, median survival reads "not reached", the
+log-rank note says a non-significant result from a conservative statistic means
+*not shown*, and the value tab says its horizon is part of the number.
+
+Two things came out of making it run rather than just writing it:
+
+- **A health probe proves nothing.** `--server.headless true` plus
+  `GET /_stcore/health` returns `ok` in three seconds, but Streamlit executes
+  the script per session, so with no browser attached the script never runs --
+  a page that would crash on line one still answers 200. The real check is
+  `streamlit.testing.v1.AppTest`, which runs the script and exposes what it
+  raised. Week 01 shipped an Airflow DAG it never executed; that lesson is why
+  this exists.
+- **It found a crash.** The horizon slider was a hardcoded 3-24 months; on a
+  store with a shorter window, every cell of the value grid was skipped and the
+  page died with `KeyError: 'plan'` out of a pandas pivot. Fixed at both ends:
+  the slider's range now comes from the store's window, and the value grid
+  refuses an impossible horizon with a message that says so.
+
 ## Data model
 
 | Table | Grain | What it holds |
@@ -292,7 +327,7 @@ problem, not a lookup.
 
 ## Status
 
-Day 5 of 7. The hazard model, the lifecycle generator with correct censoring,
+Day 6 of 7. The hazard model, the lifecycle generator with correct censoring,
 the DuckDB load, the sanity report, cohort retention, Kaplan–Meier survival and
 the churn-driver model are in place and tested. Every analysis lands on the
 process it was drawn from: a 3.920% predicted first-month hazard against 3.833%
@@ -301,5 +336,6 @@ of the planted survival function, and the driver model recovering every planted
 coefficient within 1.5 se when given the true regressor — plus a measured 58%
 attenuation when given only the observable proxy, which is the most useful
 thing the week has produced. Segment deep-dives and restricted LTV landed on day 5,
-including a measured look-ahead bias and a value grid. The Streamlit dashboard
-is day 6 and both reports are day 7.
+including a measured look-ahead bias and a value grid, and the Streamlit
+dashboard on day 6 -- which, once it was actually run headless, turned up a
+crash in its own horizon slider. Both day-7 reports are what is left.

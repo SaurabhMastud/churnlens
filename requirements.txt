@@ -9,9 +9,10 @@ numpy==2.4.6
 pandas==2.3.3
 pytest==9.1.1
 
-# Later days, installed and importable but not yet exercised by any code:
-#   scikit-learn  -- day 4 churn-driver model
-#   streamlit     -- day 6 dashboard
+# In use since day 4 (driver model) and day 6 (dashboard, including the
+# headless AppTest run) respectively:
+#   scikit-learn, streamlit
+# Still only pinned, not yet exercised by any code:
 #   fpdf2, pypdf  -- day 7 report render and its structural tests
 # Pinned here so the environment is reproducible; each moves up to "in use"
 # on the day its code lands.
