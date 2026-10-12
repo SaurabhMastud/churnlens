@@ -135,6 +135,32 @@ def test_analysis_module_never_imports_the_hazard_model(name):
     assert not [m for m in imported_modules(module) if m.startswith("src.hazard")]
 
 
+SQL_SHAPE = re.compile(r"\bselect\b.*\bfrom\b", re.IGNORECASE | re.DOTALL)
+
+
+def query_strings(module) -> list[str]:
+    """The subset of `code_strings` that is actually a query.
+
+    The latent-column guard needs this and the truth-table guard does not, and
+    the difference is worth stating. A table name is a proper noun: nothing in
+    user-facing prose has a reason to contain `subscriber_truth`, so matching
+    every string is right there. But `engagement` is an ordinary English word,
+    and the guard fired twice on honest output text -- once on a line in
+    `src/segments` explaining that the engagement signal dominates plan, and
+    once on a dashboard caption explaining that the engagement coefficient
+    comes back attenuated.
+
+    Rewording the output was the first fix, and it made the output worse: the
+    caption had to avoid the clearest word for the thing it was describing. A
+    guard that degrades the product to stay green is a guard with a bug in it,
+    so the scope narrowed instead. A latent column can only be *read* through a
+    query, and a query contains `select ... from`; that is the whole heuristic.
+    `test_a_cheating_query_is_still_caught_when_the_module_also_discusses_it`
+    is the mutation check that keeps it honest.
+    """
+    return [s for s in code_strings(module) if SQL_SHAPE.search(s)]
+
+
 @pytest.mark.parametrize("name", analysis_modules())
 def test_analysis_module_never_references_a_latent_column(name):
     """Second line behind the structural quarantine: this still fails if
@@ -143,13 +169,44 @@ def test_analysis_module_never_references_a_latent_column(name):
     `\\bengagement\\b` does not match inside `engagement_events`, since `_` is a
     word character, so the observable table is allowed and a bare column
     reference is not.
+
+    Scoped to query-shaped strings -- see `query_strings` for why, and for the
+    two false positives that forced the change.
     """
     module = importlib.import_module(name)
     patterns = [rf"\b{re.escape(field)}\b" for field in store.LATENT_FIELDS]
 
     for pattern in patterns:
-        offenders = [s for s in code_strings(module) if re.search(pattern, s)]
+        offenders = [s for s in query_strings(module) if re.search(pattern, s)]
         assert not offenders, (name, pattern, offenders)
+
+
+def test_a_cheating_query_is_still_caught_when_the_module_also_discusses_it():
+    """The narrowed guard has to keep catching the thing it is for.
+
+    Three strings, which between them cover the change: a caption that merely
+    mentions the word (must pass, that is the point), a query that reads the
+    latent column (must fail), and a query that does both at once -- prose in a
+    comment inside the SQL -- since "describe it and read it in the same
+    string" is the obvious way the narrowing could have been exploited.
+    """
+    caption = "The engagement effect comes back attenuated to about 58%."
+    cheating = "select plan, engagement from subscribers"
+    both = """
+        -- the engagement coefficient is attenuated, so read the real thing
+        select s.plan, t.engagement from subscribers s
+        join subscriber_truth t using (subscriber_id)
+    """
+    pattern = r"\bengagement\b"
+
+    assert not SQL_SHAPE.search(caption), "prose must not be treated as a query"
+    for query in (cheating, both):
+        assert SQL_SHAPE.search(query), query
+        assert re.search(pattern, query), query
+
+    # And the table-name guard is deliberately *not* narrowed, so the second
+    # query is caught twice over.
+    assert any(table in both for table in QUARANTINED_TABLES)
 
 
 def test_the_guards_are_checking_against_reality():
