@@ -28,6 +28,7 @@ making -- recorded in the decisions log rather than left as a silent omission.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import duckdb
@@ -38,6 +39,17 @@ from src import cohorts, drivers, ltv, segments, survival
 from src.store import DEFAULT_STORE
 
 TITLE = "ChurnLens - retention analytics on a known churn process"
+
+# Which store the page reads. An environment variable rather than a CLI flag
+# because `streamlit run` owns the command line, and a dashboard that can only
+# ever open one hardcoded path is awkward both to deploy and to test -- the
+# headless test in tests/test_dashboard_runs.py points this at a temporary
+# store so it does not depend on a built one lying around.
+STORE_ENV = "CHURNLENS_STORE"
+
+
+def configured_store() -> Path:
+    return Path(os.environ.get(STORE_ENV) or DEFAULT_STORE)
 
 
 def open_store(path: str | Path = DEFAULT_STORE) -> duckdb.DuckDBPyConnection:
@@ -154,7 +166,8 @@ def headline(con: duckdb.DuckDBPyConnection) -> dict:
     }
 
 
-def main(store: str | Path = DEFAULT_STORE) -> None:
+def main(store: str | Path | None = None) -> None:
+    store = Path(store) if store is not None else configured_store()
     st.set_page_config(page_title="ChurnLens", layout="wide")
     st.title(TITLE)
 
