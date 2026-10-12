@@ -160,9 +160,11 @@ def by_plan_and_activity(
     """
     prices = prices or MONTHLY_PRICE
     out = []
+    longest = 0
     for plan in sorted(prices):
         curves = segments.survival_by_activity(con, "baseline", groups, plan)
         for segment, curve in sorted(curves.items()):
+            longest = max(longest, len(curve))
             if len(curve) < horizon:
                 continue
             out.append(
@@ -174,6 +176,17 @@ def by_plan_and_activity(
                     "survival_at_horizon": curve[horizon - 1]["survival"],
                 }
             )
+
+    if not out:
+        # Skipping a thin cell is reasonable; returning an empty grid is not.
+        # A caller pivoting this into a frame got `KeyError: 'plan'` from
+        # pandas, which says nothing about the actual problem -- a horizon
+        # longer than any observed curve. `by_plan` already refuses that
+        # loudly; this now matches it.
+        raise ValueError(
+            f"horizon of {horizon} months exceeds every observed curve "
+            f"(longest is {longest} months) -- nothing left to value"
+        )
     return out
 
 

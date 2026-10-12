@@ -126,3 +126,32 @@ def test_a_missing_store_is_reported_in_the_page_rather_than_raising(tmp_path):
     assert not result.exception
     assert result.error, "expected the page to show an error element"
     assert "src.store" in result.error[0].value
+
+
+def test_the_horizon_slider_cannot_be_dragged_past_the_data(run):
+    """Regression test for a real crash.
+
+    The slider was a hardcoded 3-24 months. On a store with a shorter window --
+    this one observes 12 -- dragging it past the end skipped every cell of the
+    value grid, which left an empty frame, which made pandas raise
+    `KeyError: 'plan'` from the pivot. The page died with an error message
+    about a missing column when the actual problem was a horizon outside the
+    data.
+
+    Two fixes, both asserted: the slider's maximum now comes from the store's
+    own window, and `ltv.by_plan_and_activity` refuses an impossible horizon
+    with a message that says so (`tests/test_ltv.py` covers that half).
+    """
+    slider = run.slider[0]
+
+    assert slider.max == BUILD["window_months"]
+    assert slider.value <= BUILD["window_months"]
+    assert "extrapolate" in slider.help
+
+
+def test_moving_the_slider_to_the_window_edge_still_renders(run):
+    """And the boundary itself has to work, since it is now reachable."""
+    result = run.slider[0].set_value(BUILD["window_months"]).run()
+
+    assert not result.exception, [e.value for e in result.exception]
+    assert result.dataframe

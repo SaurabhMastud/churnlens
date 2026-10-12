@@ -287,3 +287,19 @@ def test_the_grid_uses_the_baseline_cut_not_the_look_ahead_one(con):
     }
 
     assert {(row["plan"], row["segment"]): row["at_risk"] for row in grid} == baseline
+
+
+def test_an_impossible_horizon_is_refused_by_the_grid_too(con):
+    """The other half of the dashboard crash.
+
+    `by_plan` already refused a horizon longer than the observed curve;
+    `by_plan_and_activity` quietly skipped every cell and returned an empty
+    list, which a caller pivoting into a DataFrame saw as `KeyError: 'plan'`.
+    Skipping a thin cell is reasonable, returning nothing is not.
+    """
+    with pytest.raises(ValueError, match="exceeds every observed curve"):
+        ltv.by_plan_and_activity(con, horizon=BUILD["window_months"] + 1)
+
+    # The longest honest horizon still works.
+    grid = ltv.by_plan_and_activity(con, horizon=BUILD["window_months"])
+    assert grid

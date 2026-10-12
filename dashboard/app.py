@@ -258,7 +258,22 @@ def main(store: str | Path | None = None) -> None:
         )
 
     with value_tab:
-        horizon = st.slider("horizon (months)", 3, 24, 12)
+        # Bounded by the window this store actually observed, not by a constant.
+        # With a hardcoded 3-24 range the slider could be dragged past the data
+        # on a shorter store: every cell was then skipped, the grid came back
+        # empty, and the page died with `KeyError: 'plan'` out of a pandas
+        # pivot -- an error message about the wrong thing entirely. The module
+        # now refuses that horizon explicitly, and the UI no longer offers it.
+        window = facts["window"]
+        horizon = st.slider(
+            "horizon (months)",
+            min_value=3,
+            max_value=window,
+            value=min(12, window),
+            help=f"This store observed {window} months. A longer horizon would "
+            "have to extrapolate the survival curve, which is a modelling "
+            "assumption and not something a slider should make quietly.",
+        )
         st.subheader(f"Expected value per subscriber over {horizon} months")
         st.dataframe(
             value_frame(con, horizon).style.format("{:.0f}"),
