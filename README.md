@@ -327,15 +327,53 @@ problem, not a lookup.
 
 ## Status
 
-Day 6 of 7. The hazard model, the lifecycle generator with correct censoring,
-the DuckDB load, the sanity report, cohort retention, Kaplan–Meier survival and
-the churn-driver model are in place and tested. Every analysis lands on the
-process it was drawn from: a 3.920% predicted first-month hazard against 3.833%
-observed, cohort retention and the KM curve both within a few standard errors
-of the planted survival function, and the driver model recovering every planted
-coefficient within 1.5 se when given the true regressor — plus a measured 58%
-attenuation when given only the observable proxy, which is the most useful
-thing the week has produced. Segment deep-dives and restricted LTV landed on day 5,
-including a measured look-ahead bias and a value grid, and the Streamlit
-dashboard on day 6 -- which, once it was actually run headless, turned up a
-crash in its own horizon slider. Both day-7 reports are what is left.
+**Day 7 of 7 -- complete**, tagged `week02-complete`. The hazard model, the
+lifecycle generator with correct right-censoring, the DuckDB store with its
+quarantined truth tables, the sanity report, cohort retention, Kaplan-Meier
+survival, the churn-driver model, activity segments, restricted value and the
+Streamlit dashboard are all built, tested and documented. 249 tests pass.
+
+Every analysis lands on the process it was drawn from:
+
+| Estimate | Observed | Planted | Gap |
+|---|---|---|---|
+| First-month hazard | 3.833% | 3.920% | 0.34 binomial se |
+| Pooled cohort retention | within 4 se at every tenure checked | | |
+| Kaplan-Meier survival | within 0.17-2.18 se across three seeds | | |
+| Driver coefficients (true regressor) | all within 1.5 se | | |
+| Driver coefficient (observable proxy) | -1.383 | -2.40 | 58%, measured attenuation |
+| Restricted 12-month value | within 2% per plan | | |
+
+The last row of that table is the project's most useful result and the one it
+would have been easiest to hide: given the latent regressor the model recovers
+everything, and given only the observable proxy the engagement effect comes
+back at 58% of the truth. The reliability ratio predicts 0.53 against 0.58
+observed, so it is measurement error rather than a bug -- but nothing in the
+fit's own diagnostics would have said so.
+
+Seven defects reached a committed state over the week, each with its root cause
+and detector recorded in `docs/ARCHITECTURE.md` and in the paper's evaluation
+section. The ones worth knowing about: a generated target leak that would have
+reported leakage as a near-perfect model, an optimiser default that stopped
+short of the maximum likelihood estimate and looked exactly like an analysis
+failing to recover a coefficient, and a dashboard slider that could be dragged
+past the data.
+
+## Reports
+
+Two committed PDFs, for two readers, both byte-reproducible:
+
+- **`docs/churnlens-report.pdf`** -- the full written record, rendered from
+  `docs/ARCHITECTURE.md` with `fpdf2` (`python docs/generate_report.py`).
+  Includes the decisions log, lessons learned, known limitations, the pinned
+  stack and a test inventory counted from the test files.
+- **`docs/churnlens-ieee-report.pdf`** -- a four-page IEEE-format paper from
+  its own LaTeX source (`python docs/generate_ieee_report.py`), with real
+  citations, an evaluation framed as an engineering case study, and a
+  threats-to-validity section that says plainly what the synthetic data and the
+  known functional form do not establish.
+
+Both are read back as text in the test suite -- page counts, sections,
+unresolved cross-references, mangled identifiers -- because asserting that a
+non-empty file was written passes on a report full of garbage, which is a
+mistake week 01 made and paid for.
