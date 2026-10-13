@@ -14,11 +14,20 @@ hand-rolled multi-pass loop is kept as the fallback rather than as the only
 path. The fallback is exercised by a test that forces it, so it cannot rot into
 a branch that has never run.
 
-Reproducibility: pdfTeX stamps the build time into the PDF unless
-SOURCE_DATE_EPOCH is pinned (with FORCE_SOURCE_DATE, since pdfTeX otherwise
-honours it only for \\pdfcreationdate). The committed PDF is a generated
-artifact under version control, so it has to be byte-stable or its history is
-noise -- the same reason the fpdf2 report pins its creation date.
+Reproducibility has two parts, and the second was found the hard way.
+
+1. pdfTeX stamps the build time into the PDF unless SOURCE_DATE_EPOCH is pinned
+   (with FORCE_SOURCE_DATE, since pdfTeX otherwise honours it only for
+   \\pdfcreationdate). The committed PDF is a generated artifact under version
+   control, so it has to be byte-stable or its history is noise.
+2. **The source's line endings change the output bytes.** The paper was first
+   built from a CRLF working copy; the byte-comparison test passed locally and
+   failed in a clean clone, where `.gitattributes` checks the `.tex` out as LF.
+   pdfTeX does not produce the same file from the two, so "reproducible" was
+   true only on the machine that built it. `*.tex text eol=lf` makes LF the one
+   canonical form, the committed PDF is built from that, and the clean-clone
+   run is what proves it rather than the local one. Week 01 hit the same class
+   of bug on an exported seed file, which is why a clone check is part of day 7.
 """
 from __future__ import annotations
 
