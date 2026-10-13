@@ -1,0 +1,9 @@
+# The committed PDFs are binary: never normalise line endings in them, or a
+# clone under core.autocrlf=true would see a corrupted file and the byte
+# reproducibility test would fail for a reason that has nothing to do with the
+# renderer. Week 01 hit exactly this with an exported seed file.
+*.pdf binary
+
+# LaTeX source is text and is read by pdflatex on both platforms; pin it to LF
+# so the paper builds identically either side of the CRLF boundary.
+*.tex text eol=lf
