@@ -20,14 +20,22 @@ Reproducibility has two parts, and the second was found the hard way.
    (with FORCE_SOURCE_DATE, since pdfTeX otherwise honours it only for
    \\pdfcreationdate). The committed PDF is a generated artifact under version
    control, so it has to be byte-stable or its history is noise.
-2. **The source's line endings change the output bytes.** The paper was first
-   built from a CRLF working copy; the byte-comparison test passed locally and
-   failed in a clean clone, where `.gitattributes` checks the `.tex` out as LF.
-   pdfTeX does not produce the same file from the two, so "reproducible" was
-   true only on the machine that built it. `*.tex text eol=lf` makes LF the one
-   canonical form, the committed PDF is built from that, and the clean-clone
-   run is what proves it rather than the local one. Week 01 hit the same class
-   of bug on an exported seed file, which is why a clone check is part of day 7.
+2. **pdfTeX derives the trailer `/ID` from the build path**, so the same source
+   in a different directory gave a PDF that differed in exactly those 32 bytes
+   -- identical content, identical length, identical xref offsets. The
+   committed paper therefore failed its own byte-comparison test in a fresh
+   clone while passing in the directory it was built in, which is the only
+   place the claim had ever been checked.
+
+   The first diagnosis was wrong, and is recorded because the correction is the
+   useful part: line endings were blamed (`.gitattributes` checks the `.tex`
+   out as LF, the local copy was CRLF), the working tree was renormalised, and
+   the clone still failed. Comparing the two files byte for byte -- rather than
+   theorising about them -- found a 32-byte difference in the trailer and
+   nothing else. Fixed in the document preamble with `\pdftrailerid{}`,
+   `\pdfinfoomitdate` and `\pdfsuppressptexinfo`, each guarded by
+   `\ifdefined` so the source still compiles under an engine without them.
+   The LF normalisation was good hygiene and was not the bug.
 """
 from __future__ import annotations
 

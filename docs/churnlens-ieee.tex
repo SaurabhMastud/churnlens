@@ -6,6 +6,17 @@
 \usepackage{url}
 \usepackage[hidelinks]{hyperref}
 
+% Reproducible output, and the reason this is three primitives rather than an
+% environment variable. SOURCE_DATE_EPOCH pins the creation date, but pdfTeX
+% also derives the trailer /ID from the build path, so the same source in a
+% different directory produced a PDF that differed in exactly those 32 bytes --
+% identical content, identical length, identical xref offsets, different ID.
+% That is what made the committed paper fail its own byte-comparison test in a
+% fresh clone while passing in the directory it was built in.
+\ifdefined\pdfinfoomitdate \pdfinfoomitdate=1 \fi
+\ifdefined\pdftrailerid \pdftrailerid{} \fi
+\ifdefined\pdfsuppressptexinfo \pdfsuppressptexinfo=-1 \fi
+
 \begin{document}
 
 \title{Verifying Retention Analytics Against a Known Hazard Process:\\
