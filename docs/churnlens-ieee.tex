@@ -188,8 +188,9 @@ defaulting.
 \section{Implementation}
 
 The repository holds 2{,}765 lines of application and dashboard Python and
-3{,}707 lines of tests, a ratio of about 1.3 test lines per source line, built
-over thirty commits in seven daily sessions. Analyses are plain functions
+3{,}917 lines of tests, a ratio of about 1.4 test lines per source line, built
+over seven daily sessions; its history held thirty commits when this paper was
+rendered. Analyses are plain functions
 taking a DuckDB connection and returning lists of dictionaries; each module
 also renders a text report and exposes a command-line entry point, so every
 figure quoted in this paper is reproducible from a clean clone with
@@ -223,8 +224,8 @@ measurement.
 
 \section{Verification Strategy}
 
-The suite contains 170 test functions, 240 cases after parametrisation, in
-twelve modules. It is organised around a distinction we found useful: tests of
+The suite contains 188 test functions in fourteen modules, 249 cases after
+parametrisation. It is organised around a distinction we found useful: tests of
 bookkeeping are exact, tests of estimates are statistical, and mixing them
 produces a suite that is loose where it could be strict.
 
