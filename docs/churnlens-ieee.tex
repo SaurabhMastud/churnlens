@@ -1,0 +1,465 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\begin{document}
+
+\title{Verifying Retention Analytics Against a Known Hazard Process:\\
+An Engineering Case Study}
+
+\author{\IEEEauthorblockN{Saurabh Mastud}
+\IEEEauthorblockA{Independent project\\
+\texttt{github.com/SaurabhMastud/churnlens}}}
+
+\maketitle
+
+\begin{abstract}
+Cohort retention tables, Kaplan--Meier curves, churn-driver models and
+lifetime-value estimates are routine analytics deliverables, and they share a
+structural weakness: computed on observational data, a correct analysis and a
+plausible-looking incorrect one produce the same artifact. This paper describes
+ChurnLens, a seven-day engineering exercise that inverts the usual setup.
+Subscriber lifecycles are generated from an explicit discrete-time hazard model
+whose coefficients are fixed in configuration and stored beside the data in
+tables that analysis code is structurally prevented from reading. Every
+analysis can then be asked whether it recovers the process that produced its
+input. We report the architecture, the two-level enforcement of that
+separation, and a test taxonomy that distinguishes exact bookkeeping assertions
+from statistical comparisons with stated tolerances. The evaluation is an
+honest engineering case study rather than a controlled experiment: we enumerate
+the seven defects that reached a committed state, their root causes, and what
+caught each. Three are of general interest --- a generated target leak that
+would have made a leakage artifact look like a near-perfect model, an optimiser
+default that stopped short of the maximum likelihood estimate and presented as
+a coefficient-recovery failure, and a non-deterministic quantile assignment
+that made an analysis irreproducible between runs on the same data. We close
+with threats to validity, including the fact that the generator hands the
+driver model its own functional form.
+\end{abstract}
+
+\begin{IEEEkeywords}
+survival analysis, data quality, software testing, churn prediction, measurement
+error, reproducibility
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+A retention analysis is a claim about an unobserved process. Published examples
+are almost always built on observational data whose true churn mechanism nobody
+knows, so the analysis can be sanity-checked but not verified: an incorrectly
+handled censoring rule, a quantile defined on post-outcome information, or a
+leaked target produce output that is indistinguishable, at the artifact level,
+from output produced correctly. The failure mode that matters most is the one
+that looks like success.
+
+ChurnLens addresses that gap by construction. Subscriber lifecycles are drawn
+from a discrete-time hazard
+\begin{equation}
+\mathrm{logit}\,h(t) = \beta_0 + \beta_{\mathrm{plan}} + \beta_\tau \log(1+t)
++ \beta_e e_i
+\label{eq:hazard}
+\end{equation}
+with coefficients fixed in configuration, where $t$ is tenure in months and
+$e_i \in [0,1]$ is a latent per-subscriber engagement level. The coefficients
+and the latent levels are written into the store alongside the generated data,
+in tables the analysis modules cannot read. Tests may read them. Every estimate
+therefore has a ground-truth counterpart.
+
+This paper claims the following, and nothing beyond it:
+
+\begin{enumerate}
+\item A one-way ground-truth channel --- truth readable by tests, structurally
+unreachable by analyses --- is implementable in a small project and catches
+analytical errors that no amount of internal consistency checking would.
+\item Separating that channel \emph{structurally} (truth is not in the queried
+tables) dominates separating it \emph{by convention or by test}, and we show
+the specific hole the test-only version left.
+\item Retention, survival, driver-model and value estimates computed from
+observable columns alone land within stated tolerances of the planted process,
+and we report the one quantity that does not: the engagement coefficient, which
+attenuates to 58\,\% of its planted value for reasons that are predictable and
+measurable rather than a defect.
+\item Seven defects reached a committed state over seven days. We give each
+one's root cause and the mechanism that caught it, including three that would
+have invalidated the analysis while leaving the test suite green.
+\end{enumerate}
+
+We do not claim predictive performance, generality beyond synthetic data, or
+that the approach is novel in a statistical sense; the components are standard
+and cited below. The contribution is an engineering account of making
+analytical correctness testable.
+
+\section{Background and Related Work}
+
+The estimators are classical. Kaplan and Meier's product-limit
+estimator~\cite{kaplan1958} handles right-censored observation; Greenwood's
+formula~\cite{greenwood1926} supplies its variance, which we use on the
+complementary log-log scale so that interval bounds remain inside $[0,1]$.
+Group comparison uses the log-rank statistic~\cite{mantel1966}. Because the
+data is monthly by construction, the driver model is a discrete-time hazard
+model in the sense of Allison~\cite{allison1982}, which makes logistic
+regression on subscriber-months the correctly specified estimator for
+(\ref{eq:hazard}) rather than an approximation of a continuous-time one.
+
+Three literatures inform the specific errors we instrument. Measurement error
+in a regressor attenuates its estimated coefficient toward zero by a reliability
+ratio~\cite{fuller1987}; we observe this directly, since the generator drives
+churn from a latent level while the analysis sees only noisy monthly event
+counts. Defining a group membership using information generated after the start
+of observation is immortal-time bias~\cite{suissa2008}; the natural phrasing of
+``segment subscribers by their average activity'' commits exactly that error.
+Leakage as a software-engineering phenomenon --- a feature that encodes the
+target, or an evaluation split that shares entities across folds --- is
+characterised by Kaufman \emph{et al.}~\cite{kaufman2012}.
+
+On the reporting side, we follow Gneiting and Raftery~\cite{gneiting2007} in
+using a proper scoring rule rather than accuracy, since the monthly churn rate
+is below 2\,\% and a constant prediction is 98\,\% accurate; calibration is
+assessed separately from discrimination following standard
+practice~\cite{harrell2015}. For lifetime value, Fader and
+Hardie~\cite{fader2010} show that applying an aggregate churn rate to a
+heterogeneous base misstates customer value; our hazard both declines with
+tenure and varies across subscribers, so the familiar
+$\mathrm{ARPU}/\mathrm{churn}$ shortcut is wrong here in a way we can quantify
+exactly. Implementation rests on scikit-learn~\cite{pedregosa2011} and
+DuckDB~\cite{raasveldt2019}.
+
+\section{System Architecture}
+
+\begin{table}[t]
+\caption{Components. All run; none is aspirational.}
+\label{tab:components}
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+Component & Tool & Role \\
+\midrule
+Hazard model & Python & Coefficients; ground truth \\
+Generator & Python, NumPy & Lifecycles with right-censoring \\
+Store & DuckDB & 4 analysis tables, 2 quarantined \\
+Sanity report & Python, SQL & Churn by plan, hazard by tenure \\
+Cohorts & Python, SQL & Retention matrix, pooled curves \\
+Survival & Python, SQL & Kaplan--Meier, log-rank \\
+Drivers & scikit-learn & Coefficients, calibration, scores \\
+Segments & Python, SQL & Activity-segment survival \\
+Value & Python & Restricted expected value \\
+Dashboard & Streamlit & Five tabs over the above \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:components} lists the components. The data flow is linear: the
+hazard configuration feeds the generator, which writes a DuckDB store; every
+analysis reads that store; the dashboard and the reports read the analyses.
+
+Three decisions are load-bearing.
+
+\textbf{The store is split by the contract.} Four tables are analysis-facing
+(\texttt{subscribers}, \texttt{subscription\_months},
+\texttt{engagement\_events}, \texttt{run\_meta}); two are quarantined
+(\texttt{hazard\_truth}, holding the coefficients, and
+\texttt{subscriber\_truth}, holding each subscriber's latent engagement level).
+Analyses may read the first group only.
+
+\textbf{Enforcement is structural first and by test second.} On day~1 the
+latent engagement level sat on an analysis-facing table and only a per-module
+test guarded it. That was not a theoretical weakness: substituting the latent
+level for observed activity passed every other test in the file and produced a
+cleaner result, because it was reading the answer. Day~2 moved the column to
+\texttt{subscriber\_truth}, after which an analysis cannot read what is not in
+the table it queries. The test-based guard remains as a second line, and now
+discovers analysis modules by convention --- anything under \texttt{src/} or
+\texttt{dashboard/} that is not on the generator side --- rather than being
+opted in one module at a time.
+
+\textbf{The observation window is recorded, not inferred.} Cohort exposure
+determines which cells of a retention table are observable, and the natural
+derivation (\texttt{max(signup + tenure) + 1}) is exact only if some subscriber
+is observed to the final month. A one-subscriber 24-month store whose member
+signed up in month~15 and churned at tenure~4 reports a 20-month window,
+shrinking that cohort's exposure with nothing to indicate error. The window is
+therefore carried in a provenance row, and a missing row raises rather than
+defaulting.
+
+\section{Implementation}
+
+The repository holds 2{,}765 lines of application and dashboard Python and
+3{,}707 lines of tests, a ratio of about 1.3 test lines per source line, built
+over thirty commits in seven daily sessions. Analyses are plain functions
+taking a DuckDB connection and returning lists of dictionaries; each module
+also renders a text report and exposes a command-line entry point, so every
+figure quoted in this paper is reproducible from a clean clone with
+\texttt{python -m src.<module>}.
+
+Four points of implementation substance:
+
+\emph{Exposure handling.} A retention cell a cohort has not had time to reach
+is omitted, never zeroed. Zero-filling is the standard way this goes wrong, and
+it is not visually obvious: on the committed store it drags pooled retention at
+tenure~12 from 82.5\,\% to 40.5\,\%, which reads as a finding and is an
+artifact. The exposure rule exists once, in one parameterised SQL query serving
+the matrix, the pooled curve and the segmented curves.
+
+\emph{Censoring.} The survival risk table derives who leaves the risk set from
+each subscriber's last observed month rather than from the generator's
+censoring flag, so the two can be reconciled as independent sources; they agree
+exactly. The bookkeeping is pinned by the identity $n_{t+1} = n_t - d_t - c_t$.
+
+\emph{Model fitting.} The driver model is unpenalised, because the comparison of
+interest is against planted coefficients and scikit-learn's default $L_2$
+penalty would bias the estimates by an amount nobody chose. Standard errors come
+from the inverse Fisher information, computed over the design matrix the fit
+already built, which avoids a second modelling dependency.
+
+\emph{Restricted value.} Expected value is computed over an explicit horizon
+and a horizon longer than the observed curve is refused. Survival never reaches
+zero inside the window --- it bottoms out at 75.9\,\% --- so an unrestricted
+``lifetime'' figure would be an extrapolation of the tail presented as a
+measurement.
+
+\section{Verification Strategy}
+
+The suite contains 170 test functions, 240 cases after parametrisation, in
+twelve modules. It is organised around a distinction we found useful: tests of
+bookkeeping are exact, tests of estimates are statistical, and mixing them
+produces a suite that is loose where it could be strict.
+
+\begin{enumerate}
+\item \textbf{Exact invariants.} The risk-set identity; a cohort's retention
+matrix reconciled cell by cell against the subscriber-month rows; segmented
+risk tables summing to the pooled one; censoring counts matching the
+generator's flags; the design matrix retaining every subscriber-month.
+\item \textbf{Estimate versus planted truth}, with a stated tolerance and a
+stated population. Cohort retention and the Kaplan--Meier curve agree with the
+planted survival function within four standard errors at every tenure checked;
+the tenure-0 hazard comes out at 3.833\,\% observed against 3.920\,\%
+predicted, a gap of 0.34 binomial standard errors; restricted value agrees
+within 2\,\%.
+\item \textbf{Calibration of the inferential tooling itself.} The log-rank test
+is run against a dataset rebuilt with every plan effect set to zero, so the
+null is true by construction. Across ten seeds it rejected once, consistent
+with its nominal 5\,\% size. The assertion is on the rejection rate, not on a
+single draw --- demanding zero rejections from a correctly sized test would
+assert that the test is broken.
+\item \textbf{Mutation checks.} Each guard is verified to fail when the
+behaviour it protects is reverted. Tripling every predicted hazard leaves the
+area under the ROC curve identical to twelve decimal places and moves the worst
+calibration decile past ten standard errors, which is what establishes that the
+calibration test is doing work and that discrimination alone would not notice.
+\item \textbf{Execution, not just import.} The dashboard is run headless
+through Streamlit's own script-run harness. We first used a health-endpoint
+probe, which returns \texttt{ok} in about three seconds and proves only that
+the web server started: Streamlit executes the page script per session, so with
+no client attached a page that would crash on its first line still answers 200.
+\end{enumerate}
+
+Two negative results belong here because they bound what the suite can claim.
+First, predictive scoring is a weak instrument for specification error: the
+correctly specified model beats a linear-tenure misspecification on held-out
+log loss in all five seeds tried, by 0.4\,\%. No practitioner would notice that
+margin, while the misspecified coefficient means something materially different.
+Second, the textbook warning about splitting panel data by row rather than by
+entity is directionally right but small here --- 0.0025 in mean area under the
+curve across five seeds, against a between-seed standard deviation of 0.014 ---
+because a four-parameter model has nothing to memorise. The split is still by
+subscriber, since it is free and the harm scales with model capacity, but the
+test asserts the measured claim rather than the received one.
+
+\section{Evaluation}
+
+This is an engineering case study, not a controlled experiment: there is no
+baseline implementation to compare against and no human subjects. The evidence
+we can offer honestly is the defect record. Table~\ref{tab:defects} lists every
+defect that reached a committed state, with the mechanism that caught it.
+
+\begin{table*}[t]
+\caption{Defects that reached a committed state, with root cause and detector.}
+\label{tab:defects}
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+\# & Defect & Root cause & Caught by \\
+\midrule
+1 & Churn months had no engagement row, making ``no activity'' a perfect
+target separator & Two copies of a span expression that drifted apart & Profiling
+the suite, then inspecting row counts \\
+2 & Planted coefficients were mutable despite a frozen dataclass & \texttt{frozen}
+blocks rebinding, not mutation of a contained dict & Mutation test written
+against the guard \\
+3 & Dependency pins described an environment never installed & File written from
+memory, never installed from & Comparing pins against the live interpreter \\
+4 & Latent engagement readable from an analysis-facing table & Contract enforced
+per module by test rather than structurally & Mutation-testing a new analysis
+cut \\
+5 & Optimiser stopped short of the maximum likelihood estimate & Library default
+tolerance of $10^{-4}$ & Score identity $\sum(y_i - \hat p_i) = 0$ \\
+6 & Dashboard crashed when a slider exceeded the observed window & Slider bounds
+hardcoded; empty result pivoted & Running the app headless \\
+7 & Contract guard rejected honest prose containing a column name & Guard matched
+every string literal, not just queries & Writing a user-facing caption \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Three warrant comment.
+
+\textbf{Defect 1} is the one the project exists to catch. The generator gave a
+churned subscriber a subscription-month row for the month they left but no
+engagement row for it, so all 162 churn rows lacked an activity record and all
+10{,}228 others had one. An inner join would have dropped every churn event,
+which fails loudly; a left join with zero-filling would have made ``no
+activity'' predict churn exactly and reported a leakage artifact as a
+near-perfect model. Both tables now derive their span from one shared function.
+
+\textbf{Defect 5} is the most instructive. At scikit-learn's default tolerance,
+L-BFGS left a residual of 0.98 events on 43{,}467 rows, and returned a plan
+coefficient of $-0.425$ where the converged fit gives $-0.4516$ against a
+planted $-0.45$. The symptom was a coefficient-recovery failure --- precisely
+the signal this project is built to treat as a bug in the analysis --- and the
+cause was the optimiser quitting early. The detector is worth noting because it
+needs no ground truth: the score equation for the intercept requires fitted
+probabilities to sum to the observed event count, which is checkable on real
+data.
+
+\textbf{Attenuation is not in the table}, because it is not a defect. Fitted on
+the latent regressor the model recovers every coefficient within 1.5 standard
+errors; fitted on observable activity the engagement coefficient comes back at
+$-1.383$ against a planted $-2.40$, which is 8.3 standard errors away and
+therefore bias rather than noise. The reliability ratio
+$\sigma^2_e/(\sigma^2_e + \overline{e}/12) = 0.0489/(0.0489+0.0427) = 0.53$
+predicts the 0.58 observed; the residual gap is attributable to the nonlinear
+link and to the proxy being a single month rather than a subscriber average.
+Reporting $-1.4$ as ``the engagement effect'' would understate the strongest
+lever in the modelled business by nearly half, and nothing in the fit's own
+diagnostics would say so.
+
+Two further defects were caught before any commit and are recorded for
+completeness: a quantile assignment made non-deterministic by ties at the bin
+boundary (the same store yielded 66.1\,\% and then 65.9\,\% for one cell), and
+an inferred observation window that silently shrank a cohort's exposure.
+
+\section{Discussion and Threats to Validity}
+
+\subsection{Lessons}
+
+A contract maintained by a test that someone must remember to extend is one
+module away from being maintained by nothing; discovery by convention is
+cheaper than vigilance. A guard that forces the product to get worse in order
+to stay green --- here, a caption that had to avoid the clearest word for what
+it described --- has a bug in the guard, and narrowing its scope with a mutation
+test is better than rewording the output. Finally, several of the most useful
+results in this project were negative: the measured size of a textbook bias,
+the measured weakness of held-out scoring as a specification check.
+
+\subsection{Construct validity}
+
+The quantity we verify is ``does this estimator recover the coefficients of the
+process that generated its input''. That is narrower than ``is this analysis
+useful''. An analysis can recover the planted process and still answer the wrong
+business question, and nothing here addresses that.
+
+\subsection{Internal validity}
+
+Most tolerances are stated in standard errors, but some are absolute (2\,\% for
+restricted value, 0.01 for the tenure-0 hazard) and were chosen to be loose
+enough to survive a reseed. Where a bound was sensitive we measured it across
+seeds and recorded the range rather than quoting the first value found; the
+look-ahead inflation figure, for instance, ranges 1.13--1.54 across five store
+configurations, and the single number initially observed was the largest.
+Statistical tests on the same store are not independent of one another.
+
+\subsection{External validity}
+
+The data is synthetic. It has no missing values, no duplicate records, no plan
+changes mid-life, no reactivation, no seasonality and no concept drift --- all of
+which a real retention dataset has and all of which are the usual reason an
+analysis is hard. More pointedly, the generator hands the driver model its own
+functional form: the hazard is logit-linear in $\log(1+t)$ and the model fits
+exactly that, so coefficient recovery is a test of the implementation rather
+than of model selection. The one misspecification we examine is a linear tenure
+term. Results here should be read as evidence that the implementation is
+correct, not that the approach transfers unchanged to observational data.
+
+\subsection{Unexercised components}
+
+Every component in Table~\ref{tab:components} runs, and the dashboard is
+executed in the test suite rather than merely imported. Three gaps remain. The
+dashboard has never been used by anyone other than its author, so its captions
+are untested as communication. The generator's behaviour at extreme scale is
+unmeasured: the largest store built is 6{,}000 subscribers over 36 months. And
+the log-rank implementation uses the conservative $\sum(O-E)^2/E$ form rather
+than the full variance expression, so a non-significant result from it should be
+read as ``not shown'' rather than ``no difference'' --- which the calibration run
+confirmed, finding zero rejections in twenty null datasets at 2{,}000
+subscribers.
+
+\section{Conclusion and Future Work}
+
+Generating data from a known hazard process and quarantining that process from
+the analysis made analytical correctness testable in a way that internal
+consistency checks cannot be, and the defect record suggests the cost was
+repaid: four of the seven committed defects were errors of inference that a
+conventional test suite would not have been positioned to notice. The two
+enforcement levels are not equivalent, and the structural one should come first.
+
+Three extensions follow directly. Injecting known pathologies --- missing
+engagement rows, duplicated subscribers, a mid-life plan change --- would let
+the suite assert that an analysis degrades detectably rather than silently.
+Deliberately misspecifying the generator relative to the model would test model
+selection rather than only implementation. And a correction for the measured
+attenuation, such as fitting on a subscriber-level activity average with its
+reliability estimated from the within-subscriber variance, would turn the day-4
+negative result into a method with a ground-truth check already in place.
+
+\begin{thebibliography}{00}
+
+\bibitem{kaplan1958} E. L. Kaplan and P. Meier, ``Nonparametric estimation from
+incomplete observations,'' \emph{J. Amer. Statist. Assoc.}, vol. 53, no. 282,
+pp. 457--481, 1958.
+
+\bibitem{greenwood1926} M. Greenwood, ``The natural duration of cancer,''
+\emph{Reports on Public Health and Medical Subjects}, no. 33, pp. 1--26, London:
+HMSO, 1926.
+
+\bibitem{mantel1966} N. Mantel, ``Evaluation of survival data and two new rank
+order statistics arising in its consideration,'' \emph{Cancer Chemotherapy
+Reports}, vol. 50, no. 3, pp. 163--170, 1966.
+
+\bibitem{allison1982} P. D. Allison, ``Discrete-time methods for the analysis of
+event histories,'' \emph{Sociological Methodology}, vol. 13, pp. 61--98, 1982.
+
+\bibitem{fuller1987} W. A. Fuller, \emph{Measurement Error Models}. New York:
+Wiley, 1987.
+
+\bibitem{suissa2008} S. Suissa, ``Immortal time bias in pharmacoepidemiology,''
+\emph{Amer. J. Epidemiology}, vol. 167, no. 4, pp. 492--499, 2008.
+
+\bibitem{kaufman2012} S. Kaufman, S. Rosset, C. Perlich, and O. Stitelman,
+``Leakage in data mining: Formulation, detection, and avoidance,'' \emph{ACM
+Trans. Knowl. Discov. Data}, vol. 6, no. 4, article 15, 2012.
+
+\bibitem{gneiting2007} T. Gneiting and A. E. Raftery, ``Strictly proper scoring
+rules, prediction, and estimation,'' \emph{J. Amer. Statist. Assoc.}, vol. 102,
+no. 477, pp. 359--378, 2007.
+
+\bibitem{harrell2015} F. E. Harrell, \emph{Regression Modeling Strategies},
+2nd ed. Cham: Springer, 2015.
+
+\bibitem{fader2010} P. S. Fader and B. G. S. Hardie, ``Customer-base valuation
+in a contractual setting: The perils of ignoring heterogeneity,'' \emph{Marketing
+Science}, vol. 29, no. 1, pp. 85--93, 2010.
+
+\bibitem{pedregosa2011} F. Pedregosa \emph{et al.}, ``Scikit-learn: Machine
+learning in Python,'' \emph{J. Mach. Learn. Res.}, vol. 12, pp. 2825--2830, 2011.
+
+\bibitem{raasveldt2019} M. Raasveldt and H. M\"uhleisen, ``DuckDB: An embeddable
+analytical database,'' in \emph{Proc. 2019 Int. Conf. Management of Data
+(SIGMOD)}, pp. 1981--1984, 2019.
+
+\end{thebibliography}
+
+\end{document}
